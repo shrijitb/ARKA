@@ -1,0 +1,180 @@
+================================================================================
+MARA – Multi-Agent Risk-Adjusted Capital Orchestrator
+Copyright 2025 Shrijit
+
+THIRD-PARTY LICENSE NOTICES
+================================================================================
+
+This product incorporates software from the following open-source projects,
+each distributed under their respective licenses (listed below).
+
+================================================================================
+1. NautilusTrader
+================================================================================
+
+Repository: https://github.com/nautechsystems/nautilus_trader
+License:    GNU Lesser General Public License v3.0 (LGPL-3.0)
+Copyright:  Copyright (c) 2015-2026 Nautech Systems Pty Ltd
+
+Source:
+  https://github.com/nautechsystems/nautilus_trader/blob/develop/LICENSE
+
+Terms:
+  This product uses NautilusTrader under LGPL-3.0. You may modify and
+  redistribute it under the same terms. The source code of NautilusTrader
+  modifications must be made available.
+
+Used for:
+  - Swing trading engine (MACD + Fractals strategy)
+  - Order execution and position management
+  - OHLCV backtesting harness
+  - Paper trading simulator
+
+================================================================================
+2. StockSharp (S#)
+================================================================================
+
+Repository: https://github.com/StockSharp/StockSharp
+License:    Apache License 2.0
+Copyright:  StockSharp Contributors
+
+Source:
+  https://github.com/StockSharp/StockSharp/blob/master/LICENSE
+
+Terms:
+  Licensed under Apache 2.0. Compatible with LGPL-3.0.
+
+Used for:
+  - Reference integrations and connector patterns
+  - Exploratory phase 2 (Interactive Brokers wrapper planned)
+
+================================================================================
+3. AutoHedge
+================================================================================
+
+Repository: https://github.com/The-Swarm-Corporation/AutoHedge
+License:    MIT License
+Copyright:  The Swarm Corporation
+
+Source:
+  https://github.com/The-Swarm-Corporation/AutoHedge/blob/main/LICENSE
+
+Terms:
+  Licensed under MIT. Compatible with LGPL-3.0.
+
+Used for:
+  - Multi-agent framework architecture patterns
+  - LLM advisory layer (Director, Quant, Risk agents)
+  - Ollama/phi3:mini inference integration
+
+================================================================================
+4. Polymarket Market Maker Bot
+================================================================================
+
+Repository: https://github.com/lorine93s/polymarket-market-maker-bot
+License:    Unlicensed (permissive use)
+Copyright:  lorine93s
+
+Used for:
+  - Polymarket CLOB order book reference implementation
+  - Inventory management patterns
+  - Spread farming logic
+
+================================================================================
+5. Additional Dependencies
+================================================================================
+
+Python ecosystem (dependencies listed in requirements.txt):
+  - FastAPI (MIT)
+  - Pydantic (MIT)
+  - httpx (BSD)
+  - structlog (MIT/Apache 2.0)
+  - yfinance (Apache 2.0)
+  - requests (Apache 2.0)
+  - numpy (BSD)
+  - pandas (BSD)
+  - python-dotenv (BSD)
+  - And others — see requirements.txt for complete list
+
+All Python dependencies are compatible with LGPL-3.0.
+
+================================================================================
+LGPL-3.0 COMPLIANCE STATEMENT
+================================================================================
+
+MARA is distributed under LGPL-3.0 due to its use of NautilusTrader
+(also LGPL-3.0).
+
+Key obligations:
+  1. Source code availability: The source code of MARA and any modifications
+     to NautilusTrader must be available to recipients.
+  
+  2. License compatibility: Recipients may redistribute under LGPL-3.0 terms.
+  
+  3. No restrictions on use: You may use MARA commercially or privately.
+  
+  4. Modification rights: You may modify MARA and NautilusTrader for your needs.
+
+For detailed terms, see:
+  - LICENSE file in this repository
+  - https://www.gnu.org/licenses/lgpl-3.0.txt
+
+================================================================================
+LICENSE COMPATIBILITY MATRIX
+================================================================================
+
+All dependencies are compatible with LGPL-3.0:
+
+  ✓ NautilusTrader (LGPL-3.0)    → Direct match
+  ✓ StockSharp (Apache 2.0)      → Compatible (permissive)
+  ✓ AutoHedge (MIT)              → Compatible (permissive)
+  ✓ Polymarket Bot (Unlicensed)  → Compatible (permissive)
+  ✓ Python ecosystem             → All compatible
+
+NO LICENSE CONFLICTS detected.
+
+================================================================================
+DISTRIBUTION NOTES
+================================================================================
+
+For Hardware Distribution (Raspberry Pi with MARA preloaded):
+
+  1. Include LICENSE and NOTICE.txt files with the hardware.
+  
+  2. Provide a README explaining LGPL-3.0 terms.
+  
+  3. Make source code available:
+     - Via GitHub repository (preferred)
+     - Via downloadable archive on product website
+     - Upon request from customers
+  
+  4. Document any modifications made to NautilusTrader or other
+     LGPL components.
+  
+  5. Include build/compilation instructions if distributing compiled binaries.
+
+LGPL-3.0 explicitly permits commercial distribution of hardware+software.
+You may sell Raspberry Pi devices with MARA preloaded.
+
+================================================================================
+ATTRIBUTION
+================================================================================
+
+For user-facing attribution, you may use:
+
+  "MARA is powered by NautilusTrader, an enterprise-grade trading engine
+   licensed under LGPL-3.0. For more information, visit:
+   https://github.com/nautechsystems/nautilus_trader"
+
+================================================================================
+Questions?
+================================================================================
+
+For licensing questions, refer to:
+  - https://www.gnu.org/licenses/lgpl-3.0.txt (full LGPL-3.0 text)
+  - https://www.gnu.org/licenses/gpl-faq.html (FAQ)
+  - Individual project repositories (linked above)
+
+================================================================================
+Last Updated: 2026-03-26
+================================================================================
