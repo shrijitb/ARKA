@@ -15,7 +15,7 @@ MARA is a multi-agent quantitative trading system designed for turbulent macro e
 
 ## Project Overview
 
-MARA targets futures, crypto, forex, ETFs, and prediction markets. The system operates in a sequence: backtest → paper trading → live. The development environment uses Windows laptop → WSL2 Ubuntu-24.04 → Docker Desktop 4.63.0. The production target is Raspberry Pi 5 (8GB RAM) with Docker ARM64 via buildx + QEMU.
+MARA targets futures, crypto, forex, ETFs, and prediction markets. The system operates in a sequence: backtest → paper trading → live. The development environment uses Windows laptop → WSL2 Ubuntu-24.04 → Docker Desktop 4.63.0. The production target is Raspberry Pi 5 (16GB RAM) with Docker ARM64 via buildx + QEMU.
 
 As of March 2026, the live classifier output shows WAR_PREMIUM with 80% confidence.
 
@@ -109,10 +109,10 @@ INITIAL_CAPITAL_USD = 200.0
 | FRED_API_KEY | Optional — yfinance fallback available |
 | OLLAMA_HOST | http://ollama:11434 |
 | OLLAMA_MODEL | phi3:mini |
-| ACLED_EMAIL | Configured |
-| ACLED_PASSWORD | Configured — do not commit |
-| POLY_PRIVATE_KEY | Empty — Phase 3 |
-| IBKR_HOST/PORT | 127.0.0.1:7497 — Phase 3 |
+| ACLED_EMAIL | Use institution/corporate domain |
+| ACLED_PASSWORD | Configure |
+| POLY_PRIVATE_KEY | Configure|
+| IBKR_HOST/PORT | Needs implementing |
 
 ## How to Run
 
@@ -188,7 +188,6 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 - The work is not complete regarding deployment on PiOS and backtesting still needs to be done.
 - Do not use em dashes in documentation.
-- Avoid phrasing like "its not X, its Y".
 
 ## Files Reference
 
