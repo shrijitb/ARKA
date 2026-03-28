@@ -36,7 +36,15 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 import httpx
+import requests as _requests
 from fastapi import FastAPI, HTTPException
+
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
 
 from hypervisor.allocator.capital import RegimeAllocator
 from hypervisor.regime.classifier import RegimeClassifier
@@ -61,10 +69,11 @@ PAPER_TRADING       = os.environ.get("MARA_LIVE", "false").lower() != "true"
 # docker-compose service names resolve via Docker DNS (e.g. worker-nautilus).
 # Override with env vars for local dev or Pi deploy.
 WORKER_REGISTRY: Dict[str, str] = {
-    "nautilus":   os.environ.get("NAUTILUS_URL",   "http://worker-nautilus:8001"),
-    "polymarket": os.environ.get("POLYMARKET_URL", "http://worker-polymarket:8002"),
-    "autohedge":  os.environ.get("AUTOHEDGE_URL",  "http://worker-autohedge:8003"),
-    "arbitrader": os.environ.get("ARBITRADER_URL", "http://worker-arbitrader:8004"),
+    "nautilus":       os.environ.get("NAUTILUS_URL",        "http://worker-nautilus:8001"),
+    "polymarket":     os.environ.get("POLYMARKET_URL",      "http://worker-polymarket:8002"),
+    "autohedge":      os.environ.get("AUTOHEDGE_URL",       "http://worker-autohedge:8003"),
+    "arbitrader":     os.environ.get("ARBITRADER_URL",      "http://worker-arbitrader:8004"),
+    "core_dividends": os.environ.get("CORE_DIVIDENDS_URL",  "http://worker-core-dividends:8006"),
 }
 
 # Regimes that force all directional workers to pause new entries
@@ -90,12 +99,78 @@ class HypervisorState:
         self.halt_reason:       str              = ""
         self.allocations:       Dict[str, float] = {}
         self.risk_verdict:      str              = "OK"
+        self.watchlist:         List[str]        = []
 
 
 state      = HypervisorState()
 classifier = RegimeClassifier()
 allocator  = RegimeAllocator(total_capital=INITIAL_CAPITAL_USD)
 risk_mgr   = RiskManager(initial_capital=INITIAL_CAPITAL_USD)
+
+
+# ── Telegram notification helper ──────────────────────────────────────────────
+
+_TG_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+_TG_CHAT_ID = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "")
+
+
+def _tg_send(text: str) -> None:
+    """Send a message to the configured Telegram chat. Fire-and-forget."""
+    if not _TG_TOKEN or not _TG_CHAT_ID:
+        logger.info(f"[tg_notify skipped — no token] {text}")
+        return
+    try:
+        _requests.post(
+            f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
+            json={"chat_id": _TG_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=8,
+        )
+    except Exception as exc:
+        logger.warning(f"Telegram notify failed: {exc}")
+
+
+# ── Quarterly profit sweep ─────────────────────────────────────────────────────
+
+PROFIT_TARGET_MULTIPLIER = 1.10   # 10% above initial capital before sweep
+
+
+def _run_quarterly_sweep() -> None:
+    """
+    Fires on the 7th of Jan / Apr / Jul / Oct.
+    Calculates surplus above INITIAL_CAPITAL_USD * 1.10, logs it, and
+    sends a Telegram alert.
+
+    # PHASE 3: wire IBKR redemption — transfer surplus to bank account.
+    # PHASE 3: wire USDT redemption — swap surplus USDT → fiat via OKX.
+    """
+    target     = INITIAL_CAPITAL_USD * PROFIT_TARGET_MULTIPLIER
+    surplus    = round(state.total_capital - target, 2)
+    total      = round(state.total_capital, 2)
+    regime     = state.current_regime
+    cycle      = state.cycle_count
+
+    if surplus > 0:
+        msg = (
+            f"📈 *MARA Quarterly Profit Sweep*\n"
+            f"Total capital: ${total:.2f}\n"
+            f"Target floor:  ${target:.2f} (initial × 1.10)\n"
+            f"Surplus:       *${surplus:.2f}*\n"
+            f"Regime: `{regime}` | Cycles: {cycle}\n\n"
+            f"_PHASE 3: IBKR/USDT redemption not yet wired._"
+        )
+        logger.info(f"Quarterly sweep: surplus=${surplus:.2f} above ${target:.2f} floor")
+    else:
+        shortfall = round(target - state.total_capital, 2)
+        msg = (
+            f"📊 *MARA Quarterly Sweep — No Surplus*\n"
+            f"Total capital: ${total:.2f}\n"
+            f"Target floor:  ${target:.2f}\n"
+            f"Shortfall:     ${shortfall:.2f}\n"
+            f"Regime: `{regime}` | Cycles: {cycle}"
+        )
+        logger.info(f"Quarterly sweep: no surplus — ${shortfall:.2f} below target")
+
+    _tg_send(msg)
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -110,12 +185,32 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 60)
 
     task = asyncio.create_task(orchestration_loop())
+
+    # Quarterly profit sweep — 7th of Jan / Apr / Jul / Oct
+    scheduler = None
+    if _APSCHEDULER_AVAILABLE:
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(
+            _run_quarterly_sweep,
+            CronTrigger(month="1,4,7,10", day=7, hour=9, minute=0),
+            id="quarterly_sweep",
+            replace_existing=True,
+        )
+        scheduler.start()
+        logger.info("Quarterly profit sweep scheduler started (Jan/Apr/Jul/Oct 7th @ 09:00)")
+    else:
+        logger.warning("APScheduler not installed — quarterly sweep disabled. "
+                       "Add apscheduler to requirements.txt.")
+
     yield
+
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
+    if scheduler:
+        scheduler.shutdown(wait=False)
     logger.info("MARA Hypervisor shut down cleanly.")
 
 
@@ -418,3 +513,37 @@ async def manual_resume():
                 except Exception:
                     pass
     return {"resumed": True, "workers": healthy}
+
+
+@app.post("/workers/{worker}/pause")
+async def pause_worker(worker: str):
+    url = WORKER_REGISTRY.get(worker)
+    if not url:
+        raise HTTPException(status_code=404, detail=f"Unknown worker: {worker}")
+    await _pause_worker(worker)
+    return {"paused": worker}
+
+
+@app.post("/workers/{worker}/resume")
+async def resume_worker(worker: str):
+    url = WORKER_REGISTRY.get(worker)
+    if not url:
+        raise HTTPException(status_code=404, detail=f"Unknown worker: {worker}")
+    await _resume_worker(worker)
+    return {"resumed": worker}
+
+
+@app.get("/watchlist")
+async def get_watchlist():
+    return {"watchlist": state.watchlist}
+
+
+@app.post("/watchlist")
+async def add_to_watchlist(body: dict):
+    ticker = body.get("ticker", "").upper().strip()
+    if not ticker:
+        raise HTTPException(status_code=400, detail="ticker required")
+    if ticker not in state.watchlist:
+        state.watchlist.append(ticker)
+        logger.info(f"Watchlist: added {ticker}")
+    return {"watchlist": state.watchlist}

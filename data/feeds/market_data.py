@@ -141,21 +141,15 @@ def get_vix() -> float:
 
 def get_dxy() -> float:
     """
-    DXY spot. Strong USD (>104) = risk-off, weak USD (<100) = risk-on.
-    yfinance ticker: DX-Y.NYB
+    DXY proxy via UUP ETF (Invesco DB US Dollar Index Bullish Fund).
+    UUP tracks the Deutsche Bank Long US Dollar Index — reliable yfinance
+    data with no KeyError/empty-frame issues affecting DX=F and DX-Y.NYB.
+    Strong USD (UUP > 28) = risk-off, weak USD (UUP < 26) = risk-on.
     """
     def _fetch():
-        for _ticker in ("DX=F", "DX-Y.NYB"):  # DX=F first — more reliable, avoids KeyError noise
-            try:
-                df = yf.download(_ticker, period="5d", progress=False, auto_adjust=True)
-                if not df.empty:
-                    break
-            except Exception:
-                df = None
-        if df is None:
-            df = type("_E", (), {"empty": True})()
+        df = yf.download("UUP", period="5d", progress=False, auto_adjust=True)
         if df.empty:
-            raise ValueError("DXY returned empty")
+            raise ValueError("UUP returned empty — yfinance may be down")
         return _last_close(df)
     return _cached("dxy", CACHE_TTL, _fetch)
 
@@ -408,12 +402,8 @@ def get_macro_snapshot() -> dict:
         "gold_oil_ratio":       get_gold_oil_ratio,
         "defense_momentum_20d": get_defense_momentum,
         "btc_funding_rate":     lambda: get_crypto_funding_rate("BTC-USDT-SWAP"),
-        # war_premium_score uses already-fetched values to avoid duplicate API calls
-        "war_premium_score":    lambda: get_war_premium_score(
-            defense_momentum = snapshot.get("defense_momentum_20d") or get_defense_momentum(),
-            gold_oil_ratio   = snapshot.get("gold_oil_ratio")       or get_gold_oil_ratio(),
-            vix              = snapshot.get("vix")                  or get_vix(),
-        ).get("war_premium_score", 0.0),
+        # war_premium_score fetches its own market data internally
+        "war_premium_score":    get_war_premium_score,
     }
 
     for key, fn in fetchers.items():

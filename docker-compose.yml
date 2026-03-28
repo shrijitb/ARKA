@@ -19,9 +19,9 @@ services:
       OLLAMA_KEEP_ALIVE: 24h
     restart: unless-stopped
     healthcheck:
-      # /api/version always returns 200 regardless of whether models are loaded.
-      # /api/tags can return empty body which some curl builds reject with -f.
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/version > /dev/null"]
+      # ollama/ollama image has no curl/wget — use the ollama binary itself.
+      # `ollama list` exits 0 when the server is ready, non-zero otherwise.
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
       retries: 6
@@ -85,7 +85,8 @@ services:
     env_file: .env
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      # polymarket image has no curl — use python3 (always present in python:3.11-slim)
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=4)"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -126,6 +127,34 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8004/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  worker-telegram-bot:
+    build: ./workers/telegram_bot
+    container_name: mara-telegram-bot
+    depends_on:
+      hypervisor:
+        condition: service_healthy
+    environment:
+      HYPERVISOR_URL: "http://hypervisor:8000"
+    env_file: .env
+    restart: unless-stopped
+
+  worker-core-dividends:
+    build: ./workers/core_dividends
+    container_name: mara-core-dividends
+    depends_on:
+      hypervisor:
+        condition: service_healthy
+    ports:
+      - "8006:8006"
+    env_file: .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8006/health"]
       interval: 30s
       timeout: 5s
       retries: 3

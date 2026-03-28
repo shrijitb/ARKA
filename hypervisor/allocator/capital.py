@@ -9,10 +9,11 @@ Maps the current market regime → worker allocation weights, adjusted for:
   - Cash buffer (enforced minimum reserve, scaled up in crisis regimes)
 
 Worker keys match docker-compose service names exactly:
-    arbitrader  — Java cross-exchange price arb (delta-neutral, port 8004)
-    nautilus    — NautilusTrader strategies incl. MACD/Fractals swing (port 8001)
-    polymarket  — CLOB market-making (port 8002)
-    autohedge   — AI advisory pipeline, Director+Quant+Risk (port 8003)
+    arbitrader      — Java cross-exchange price arb (delta-neutral, port 8004)
+    nautilus        — NautilusTrader strategies incl. MACD/Fractals swing (port 8001)
+    polymarket      — CLOB market-making (port 8002)
+    autohedge       — AI advisory pipeline, Director+Quant+Risk (port 8003)
+    core_dividends  — Passive dividend sleeve: SCHD + VYM buy-and-hold (port 8006)
 
 NOTE: swing_trend is NOT a separate worker. Swing strategies run inside
 NautilusTrader (workers/nautilus/) and are allocated via the 'nautilus' key.
@@ -31,65 +32,76 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         # Nautilus: swing strategies ride defense/commodity momentum; backtest confirms
         # Polymarket: war/election prediction markets are maximally active
         # AutoHedge: advisory paused — high uncertainty degrades model output quality
-        "arbitrader":  0.45,
-        "nautilus":    0.25,   # absorbed former swing_trend (0.10) + nautilus (0.15)
-        "polymarket":  0.30,
-        "autohedge":   0.00,
+        # core_dividends: 20% passive sleeve — SCHD/VYM hold through volatility
+        "arbitrader":     0.36,
+        "nautilus":       0.20,
+        "polymarket":     0.24,
+        "autohedge":      0.00,
+        "core_dividends": 0.20,
     },
 
     "CRISIS_ACUTE": {
         # Cash is king. Cut everything. VaR too high for directional bets.
         # Arbitrader survives — delta-neutral, earns while flat.
         # 50%+ stays in cash (MAX_DEPLOY_PCT = 0.50 in this regime).
-        "arbitrader":  0.40,
-        "nautilus":    0.10,
-        "polymarket":  0.20,
-        "autohedge":   0.00,
+        # core_dividends: 0% — even passive positions are liquidated in acute crisis.
+        "arbitrader":     0.40,
+        "nautilus":       0.10,
+        "polymarket":     0.20,
+        "autohedge":      0.00,
+        "core_dividends": 0.00,
     },
 
     "BEAR_RECESSION": {
         # Nautilus swing strategies expected to SHORT (MACD reads direction itself).
         # Arbitrader trimmed — price spreads narrow as volume dries up.
         # Polymarket: recession/rate-cut prediction markets active.
-        "arbitrader":  0.25,
-        "nautilus":    0.45,   # swing shorts + systematic signals
-        "polymarket":  0.20,
-        "autohedge":   0.10,
+        # core_dividends: 20% — dividend ETFs are defensive in slow recessions.
+        "arbitrader":     0.20,
+        "nautilus":       0.36,
+        "polymarket":     0.16,
+        "autohedge":      0.08,
+        "core_dividends": 0.20,
     },
 
     "BULL_FROTHY": {
         # Arbitrader: leveraged longs paying high funding → maximum spread
         # Nautilus: LONG setups abundant in bull — maximum swing allocation
         # Polymarket: election/macro markets quiet in calm bull
-        "arbitrader":  0.35,
-        "nautilus":    0.45,   # swing longs + systematic momentum
-        "polymarket":  0.10,
-        "autohedge":   0.10,
+        # core_dividends: 20% passive — dividend capture in risk-on environment.
+        "arbitrader":     0.28,
+        "nautilus":       0.36,
+        "polymarket":     0.08,
+        "autohedge":      0.08,
+        "core_dividends": 0.20,
     },
 
     "REGIME_CHANGE": {
         # Transition: direction unknown. Favour delta-neutral + systematic.
         # Reduce nautilus swing allocation until new regime stabilises.
-        "arbitrader":  0.40,
-        "nautilus":    0.30,
-        "polymarket":  0.20,
-        "autohedge":   0.10,
+        "arbitrader":     0.32,
+        "nautilus":       0.24,
+        "polymarket":     0.16,
+        "autohedge":      0.08,
+        "core_dividends": 0.20,
     },
 
     "SHADOW_DRIFT": {
         # Hidden pressure — BDI moving but VIX calm. Moderate caution.
-        "arbitrader":  0.40,
-        "nautilus":    0.35,
-        "polymarket":  0.15,
-        "autohedge":   0.10,
+        "arbitrader":     0.32,
+        "nautilus":       0.28,
+        "polymarket":     0.12,
+        "autohedge":      0.08,
+        "core_dividends": 0.20,
     },
 
     "BULL_CALM": {
         # Default / peacetime. Balanced. Nautilus gets most directional capital.
-        "arbitrader":  0.30,
-        "nautilus":    0.45,
-        "polymarket":  0.10,
-        "autohedge":   0.15,
+        "arbitrader":     0.24,
+        "nautilus":       0.36,
+        "polymarket":     0.08,
+        "autohedge":      0.12,
+        "core_dividends": 0.20,
     },
 }
 
@@ -186,9 +198,14 @@ class RegimeAllocator:
             result.cash_reserve = self.total_capital
             return result
 
-        total_weight = sum(eligible.values())
+        # Normalise against the SUM OF ALL NON-ZERO PROFILE WEIGHTS, not just the
+        # eligible subset.  This means a single healthy worker only receives its
+        # intended profile share, even if all other workers are still starting up.
+        # Without this, a single eligible worker absorbs all of max_deploy and
+        # exceeds the risk manager's per-worker cap (50%).
+        profile_nonzero_sum = sum(w for w in profile.values() if w > 0.0)
         result.allocations = {
-            w: round(max_deploy * (wt / total_weight), 2)
+            w: round(max_deploy * (wt / profile_nonzero_sum), 2)
             for w, wt in eligible.items()
         }
         result.cash_reserve = round(

@@ -248,11 +248,17 @@ class RiskManager:
         self._halt_timestamp = None
 
     def record_worker_allocation(self, worker: str, amount_usd: float) -> None:
-        """Call when capital is first allocated to a worker — sets drawdown baseline."""
+        """Call when capital is allocated or re-allocated to a worker.
+
+        Recalibrates the drawdown baseline to the current position value so that
+        a hypervisor re-allocation (e.g. more workers joining mid-run) does not
+        appear as a drawdown.  Actual PnL losses will still fire the drawdown gate
+        because current_pnl only moves via worker /status reports, not here.
+        """
         state = self._get_worker_state(worker)
         state.entry_capital = amount_usd
-        if amount_usd > state.peak_capital:
-            state.peak_capital = amount_usd
+        # Reset peak to current position value.  Drawdown accumulates from here.
+        state.peak_capital = amount_usd + state.current_pnl
         logger.info(f"RiskManager: {worker} entry capital set to ${amount_usd:.2f}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────

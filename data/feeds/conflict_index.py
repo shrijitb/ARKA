@@ -37,6 +37,7 @@ import os
 import time
 import urllib.request
 import urllib.parse
+import requests as _requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -96,84 +97,96 @@ GOLD_OIL_BASELINE  = 35.0   # Pre-2020 historical peacetime norm
 GOLD_OIL_WAR_LEVEL = 52.0   # Clearly elevated — systemic risk priced in
 
 
-# ── Token cache (module-level, survives across calls in same process) ─────────
-
-_token_cache: dict = {
-    "access_token":  None,
-    "refresh_token": None,
-    "expires_at":    0.0,
-}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ACLED Authentication
+# ACLED Authentication — token manager
 # ─────────────────────────────────────────────────────────────────────────────
+
+class AcledTokenManager:
+    """In-memory OAuth token manager. Caches access token for 24h, uses
+    refresh token to silently renew, falls back to full password auth."""
+
+    def __init__(self):
+        self._access_token:  Optional[str] = None
+        self._refresh_token: Optional[str] = None
+        self._expires_at:    float         = 0.0
+
+    def get_token(self, email: str, password: str) -> Optional[str]:
+        if not email or not password:
+            logger.warning("ACLED_EMAIL / ACLED_PASSWORD not set — ACLED layers skipped")
+            return None
+        if self._access_token and time.time() < self._expires_at - 300:
+            return self._access_token
+        if self._refresh_token:
+            token = self._refresh(email)
+            if token:
+                return token
+        return self._fetch_fresh(email, password)
+
+    def _fetch_fresh(self, email: str, password: str) -> Optional[str]:
+        try:
+            r = _requests.post(
+                ACLED_TOKEN_URL,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "username":   email,
+                    "password":   password,
+                    "grant_type": "password",
+                    "client_id":  "acled",
+                },
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                self._access_token  = data["access_token"]
+                self._refresh_token = data.get("refresh_token")
+                self._expires_at    = time.time() + data.get("expires_in", 86400)
+                logger.info("ACLED: fresh token acquired, valid 24h")
+                return self._access_token
+            else:
+                logger.error(f"ACLED auth failed: {r.status_code} {r.text[:200]}")
+                return None
+        except Exception as exc:
+            logger.error(f"ACLED auth exception: {exc}")
+            return None
+
+    def _refresh(self, email: str) -> Optional[str]:
+        try:
+            r = _requests.post(
+                ACLED_TOKEN_URL,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "grant_type":    "refresh_token",
+                    "refresh_token": self._refresh_token,
+                    "client_id":     "acled",
+                },
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                self._access_token  = data["access_token"]
+                self._refresh_token = data.get("refresh_token", self._refresh_token)
+                self._expires_at    = time.time() + data.get("expires_in", 86400)
+                logger.info("ACLED: token refreshed silently")
+                return self._access_token
+            else:
+                logger.warning(f"ACLED refresh failed ({r.status_code}), will retry with password")
+                self._refresh_token = None
+                return None
+        except Exception as exc:
+            logger.error(f"ACLED refresh exception: {exc}")
+            return None
+
+
+# Module-level singleton
+_token_manager = AcledTokenManager()
+
 
 def _get_acled_token() -> Optional[str]:
-    """
-    Returns a valid Bearer token.
-    Caches for 24 hours, auto-refreshes using refresh_token.
-    Falls back to full re-auth from .env on first call or cache miss.
-    """
-    now = time.time()
-    if _token_cache["access_token"] and now < _token_cache["expires_at"] - 300:
-        return _token_cache["access_token"]
-
-    email    = os.environ.get("ACLED_EMAIL", "")
-    password = os.environ.get("ACLED_PASSWORD", "")
-    if not email or not password:
-        logger.warning("ACLED_EMAIL / ACLED_PASSWORD not in .env — ACLED layers skipped")
-        return None
-
-    # Try refresh token first (avoids re-sending password)
-    if _token_cache["refresh_token"]:
-        token = _post_token(urllib.parse.urlencode({
-            "refresh_token": _token_cache["refresh_token"],
-            "grant_type":    "refresh_token",
-            "client_id":     "acled",
-        }).encode())
-        if token:
-            return token
-
-    # Full credential auth
-    return _post_token(urllib.parse.urlencode({
-        "username":   email,
-        "password":   password,
-        "grant_type": "password",
-        "client_id":  "acled",
-    }).encode())
-
-
-def _post_token(payload: bytes) -> Optional[str]:
-    req = urllib.request.Request(
-        ACLED_TOKEN_URL,
-        data    = payload,
-        method  = "POST",
-        headers = {"Content-Type": "application/x-www-form-urlencoded"},
+    """Internal helper — reads credentials from env and delegates to the manager."""
+    return _token_manager.get_token(
+        os.environ.get("ACLED_EMAIL", ""),
+        os.environ.get("ACLED_PASSWORD", ""),
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-        _token_cache["access_token"]  = data["access_token"]
-        _token_cache["refresh_token"] = data.get("refresh_token")
-        _token_cache["expires_at"]    = time.time() + data.get("expires_in", 86400)
-        logger.info(f"ACLED token refreshed, expires in {data.get('expires_in', 0)//3600}h")
-        return data["access_token"]
-    except urllib.error.HTTPError as exc:
-        if exc.code == 403:
-            logger.error(
-                "ACLED token 403 Forbidden — credentials rejected. "
-                "Check: (1) ACLED_PASSWORD in .env is current, "
-                "(2) account verified at acleddata.com/account/, "
-                "(3) ACLED may have migrated to API-key auth — "
-                "log in at acleddata.com and check for an API Key tab."
-            )
-        else:
-            logger.error(f"ACLED token HTTP {exc.code}: {exc}")
-        return None
-    except Exception as exc:
-        logger.error(f"ACLED token request failed: {exc}")
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,30 +269,20 @@ def _fetch_acled_live(token: str, lookback_days: int = 30) -> dict:
     """
     Fetch recent lethal events from /api/acled/read.
 
-    BUG FIXED — two issues that both caused 0 rows returned:
+    Country filter uses pipe-separated syntax (same as CAST endpoint):
+        country=Ukraine|Russia|Syria
+    Pipe is injected directly into the URL string — _acled_read does NOT
+    use urllib.parse.urlencode so the pipe is not percent-encoded.
 
-    Issue 1 (PRIMARY): The original code sent BOTH:
-        "country": "Ukraine:OR:country=Russia..."  (inline OR syntax)
-        "country_where": "OR"                       (separate OR param)
-    These are two mutually exclusive approaches to multi-country queries.
-    Sending both is contradictory — ACLED's server returns an empty dataset.
-    Fix: use inline `:OR:country=` syntax ONLY, no `country_where` param.
-
-    Issue 2 (SECONDARY): requests.get(params=params) URL-encodes the country
-    string: colons → %3A, equals → %3D. ACLED may not parse these back.
-    Fix: inject the country string directly into the URL string using urllib,
-    bypassing requests' automatic encoding.
-
-    Fallback: if multi-country still returns 0, run single-country (Ukraine)
-    to tell us whether it's a syntax issue or an account access tier issue.
+    Fallback: if multi-country returns 0, run single-country (Ukraine) to
+    distinguish a query syntax issue from an account access tier issue.
     """
     end_dt    = datetime.now(timezone.utc)
     start_dt  = end_dt - timedelta(days=lookback_days)
     date_range = f"{start_dt.strftime('%Y-%m-%d')}|{end_dt.strftime('%Y-%m-%d')}"
 
-    # Inline OR syntax — no country_where param, no URL encoding of colons/equals
-    first, *rest = ACLED_WATCH_COUNTRIES
-    country_str  = first + "".join(f":OR:country={c}" for c in rest)
+    # Pipe-separated — consistent with CAST endpoint syntax
+    country_str = "|".join(ACLED_WATCH_COUNTRIES)
 
     result = _acled_read(token, country_str, date_range, label="multi-country")
 
@@ -524,6 +527,15 @@ def _score_market_proxy(market: dict) -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API  (called by market_data.py every cycle)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def get_acled_token(email: str, password: str) -> Optional[str]:
+    """
+    Public ACLED token fetcher for testing and external callers.
+    Uses the module-level token manager (cache-aware).
+    Returns the access_token string, or None on failure.
+    """
+    return _token_manager.get_token(email, password)
+
 
 def get_war_premium_score() -> float:
     """

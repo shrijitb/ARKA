@@ -365,6 +365,30 @@ class TestCapitalAllocator:
         )
         print(f"\n  Sharpe penalty: ${base_amt:.2f} → ${pen_amt:.2f}  delta=${base_amt - pen_amt:.2f}")
 
+    def test_single_healthy_worker_stays_below_50pct(self, allocator):
+        """Startup race: only one worker healthy → must not exceed 50% of capital.
+
+        Without profile-weight normalisation, the eligible-only normaliser gives
+        the single worker 100% of max_deploy (80% of capital), firing the risk
+        manager's per-worker cap and halting the system on every cold start.
+        """
+        result = allocator.compute(
+            regime="BULL_CALM",
+            worker_health={
+                "nautilus": False, "polymarket": False,
+                "arbitrader": False, "core_dividends": False,
+                "autohedge": True,
+            },
+        )
+        alloc = result.allocations.get("autohedge", 0)
+        assert alloc <= 100.0, (
+            f"Single healthy worker (autohedge) received ${alloc:.2f} "
+            f"which exceeds 50% ($100) of $200 capital.\n"
+            f"  full allocations: {result.allocations}\n"
+            f"  FIX: normalise against profile_nonzero_sum, not eligible sum"
+        )
+        print(f"\n  Single-worker startup: autohedge=${alloc:.2f} (limit=$100.00)")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 3. Risk Manager
@@ -489,6 +513,27 @@ class TestRiskManagerIntegration:
             f"Expected 'arbitrader', got: {verdict.affected_worker!r}"
         print(f"\n  Worker halt: {verdict.reason}  affected={verdict.affected_worker}")
 
+    def test_reallocation_down_does_not_trigger_false_drawdown(self, rm):
+        """Regression: when more workers join mid-run, hypervisor re-allocates each
+        worker with a lower amount.  record_worker_allocation() must reset the peak
+        so the reduction doesn't appear as a drawdown and halt the system."""
+        # Cycle 1: only autohedge healthy, gets $60
+        rm.record_worker_allocation("autohedge", 60.0)
+        # Cycle 2: all workers join, autohedge scaled down to $19.2
+        rm.record_worker_allocation("autohedge", 19.2)
+        verdict = rm.assess(
+            total_capital=200.0, free_capital=40.0, open_positions=0,
+            worker_pnl={"autohedge": 0.0},
+            worker_allocated={"autohedge": 19.2},
+        )
+        assert verdict.safe, (
+            f"Re-allocation from $60→$19.2 (more workers joining) should NOT "
+            f"trigger a drawdown halt.\n"
+            f"  Got safe=False: {verdict.reason!r}\n"
+            f"  FIX: record_worker_allocation() must reset peak to new entry+pnl"
+        )
+        print(f"\n  Re-allocation regression: {verdict.reason!r}")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 4. Hypervisor Cycle Logic
@@ -531,9 +576,14 @@ class TestHypervisorCycle:
         print(f"\n  Key alignment OK: {sorted(registry_keys)}")
 
     def test_reconcile_capital_math(self, hyp):
-        hyp.INITIAL_CAPITAL_USD    = 200.0
-        hyp.state.worker_pnl       = {"nautilus": 5.0, "arbitrader": -2.0}
-        hyp.state.worker_allocated = {"nautilus": 80.0, "arbitrader": 60.0}
+        # Test live-mode math: PAPER_TRADING=False so PnL is added to capital.
+        # _reconcile_capital reads state.allocations (authoritative hypervisor view),
+        # not state.worker_allocated (lagging worker-reported view).
+        orig_paper             = hyp.PAPER_TRADING
+        hyp.PAPER_TRADING      = False
+        hyp.INITIAL_CAPITAL_USD = 200.0
+        hyp.state.worker_pnl   = {"nautilus": 5.0, "arbitrader": -2.0}
+        hyp.state.allocations  = {"nautilus": 80.0, "arbitrader": 60.0}
 
         hyp._reconcile_capital()
 
@@ -550,9 +600,10 @@ class TestHypervisorCycle:
             f"free_capital wrong\n"
             f"  expected: ${expected_free:.2f}\n"
             f"  got:      ${hyp.state.free_capital:.2f}\n"
-            f"  formula:  total_capital - sum(worker_allocated)"
+            f"  formula:  total_capital - sum(state.allocations)"
         )
         print(f"\n  Capital reconciled: total=${hyp.state.total_capital:.2f}  free=${hyp.state.free_capital:.2f}")
+        hyp.PAPER_TRADING = orig_paper
 
     def test_open_position_count_sums_across_workers(self, hyp):
         hyp.state.worker_status = {

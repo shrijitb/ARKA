@@ -23,7 +23,9 @@ PAPER_TRADING           = True
 SLIPPAGE_MODEL_PCT      = 0.0005
 FEE_MODEL_PCT           = 0.0004
 
-EXCHANGES               = ["binance", "bybit"]   # both geo-blocked; use OKX at runtime
+EXCHANGES               = ["okx"]
+RECESSION_PAIRS         = ["SH", "PSQ"]
+RECESSION_REGIMES       = ["BEAR_RECESSION", "CRISIS_ACUTE"]
 QUOTE_CURRENCY          = "USDT"
 
 USE_LIVE_RATES          = False

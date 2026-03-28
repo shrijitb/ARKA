@@ -48,6 +48,12 @@ logger = structlog.get_logger(__name__)
 
 WORKER_NAME = "nautilus"
 
+# ── Recession hedge pairs — inverse ETFs, signals only (IBKR not wired yet) ──
+# Mirrors config.py RECESSION_PAIRS / RECESSION_REGIMES.
+# advisory_only=True until Phase 3 (StockSharp/IBKR).
+RECESSION_PAIRS   = ["SH", "PSQ"]
+RECESSION_REGIMES = {"BEAR_RECESSION", "CRISIS_ACUTE"}
+
 # ── OKX symbol map — NautilusTrader InstrumentId format ──────────────────────
 # Perpetual swaps only. OKX is geo-unblocked for MARA's location.
 OKX_INSTRUMENTS = {
@@ -330,16 +336,35 @@ async def signal(body: dict):
         return []
 
     signals = []
+
+    # Recession hedge — inverse ETF signals for bear/crisis regimes.
+    # advisory_only=True: hypervisor logs these but does not execute until
+    # IBKR is wired in Phase 3 (StockSharp).
+    if state.current_regime in RECESSION_REGIMES:
+        for pair in RECESSION_PAIRS:
+            signals.append({
+                "worker":             WORKER_NAME,
+                "symbol":             pair,
+                "direction":          "long",   # long the inverse ETF
+                "confidence":         0.7,
+                "suggested_size_pct": 0.15,
+                "regime_tags":        [state.current_regime],
+                "ttl_seconds":        3600,
+                "advisory_only":      True,     # PHASE 3: remove when IBKR wired
+                "rationale":          f"Inverse ETF recession hedge | regime={state.current_regime}",
+            })
+
+    # Swing signals for OKX crypto perps
     for pair, instrument in OKX_INSTRUMENTS.items():
         signals.append({
-            "worker":    WORKER_NAME,
-            "symbol":    instrument,
-            "direction": "long" if state.bias == "momentum_long" else "neutral",
-            "confidence": 0.6,
+            "worker":             WORKER_NAME,
+            "symbol":             instrument,
+            "direction":          "long" if state.bias == "momentum_long" else "neutral",
+            "confidence":         0.6,
             "suggested_size_pct": 0.4,
-            "regime_tags": [state.current_regime],
-            "ttl_seconds": 3600,
-            "rationale": f"MACD+Fractals | bias={state.bias} | regime={state.current_regime}",
+            "regime_tags":        [state.current_regime],
+            "ttl_seconds":        3600,
+            "rationale":          f"MACD+Fractals | bias={state.bias} | regime={state.current_regime}",
         })
     return signals
 
