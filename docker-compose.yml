@@ -92,17 +92,17 @@ services:
       retries: 3
       start_period: 15s
 
-  worker-autohedge:
-    build: ./workers/autohedge
-    container_name: mara-autohedge
+  worker-analyst:
+    build: ./workers/analyst
+    container_name: mara-analyst
     depends_on:
-      # service_started not service_healthy — autohedge handles Ollama
-      # connection failure gracefully (stub mode, advisory_only=True).
       ollama:
         condition: service_started
     ports:
       - "8003:8003"
     env_file: .env
+    environment:
+      ANALYST_URL: "http://worker-analyst:8003"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
@@ -160,6 +160,36 @@ services:
       retries: 3
       start_period: 15s
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mara-prometheus
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      hypervisor:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: mara-grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-mara_local}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
   worker-stocksharp:
     build: ./workers/stocksharp/src
     container_name: mara-stocksharp
@@ -177,3 +207,5 @@ services:
 volumes:
   ollama_data:
   arbitrader_logs:
+  prometheus_data:
+  grafana_data:

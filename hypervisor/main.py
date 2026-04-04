@@ -38,6 +38,7 @@ from typing import Dict, List, Optional
 import httpx
 import requests as _requests
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -49,6 +50,7 @@ except ImportError:
 from hypervisor.allocator.capital import RegimeAllocator
 from hypervisor.regime.classifier import RegimeClassifier
 from hypervisor.risk.manager import RiskManager
+from hypervisor.risk.execution_risk import ExecutionRiskChecker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,7 +73,7 @@ PAPER_TRADING       = os.environ.get("MARA_LIVE", "false").lower() != "true"
 WORKER_REGISTRY: Dict[str, str] = {
     "nautilus":       os.environ.get("NAUTILUS_URL",        "http://worker-nautilus:8001"),
     "polymarket":     os.environ.get("POLYMARKET_URL",      "http://worker-polymarket:8002"),
-    "autohedge":      os.environ.get("AUTOHEDGE_URL",       "http://worker-autohedge:8003"),
+    "analyst":        os.environ.get("ANALYST_URL",         "http://worker-analyst:8003"),
     "arbitrader":     os.environ.get("ARBITRADER_URL",      "http://worker-arbitrader:8004"),
     "core_dividends": os.environ.get("CORE_DIVIDENDS_URL",  "http://worker-core-dividends:8006"),
 }
@@ -100,12 +102,18 @@ class HypervisorState:
         self.allocations:       Dict[str, float] = {}
         self.risk_verdict:      str              = "OK"
         self.watchlist:         List[str]        = []
+        self.execution_risk_state: Dict         = {}
+        self.war_premium_score: float            = 0.0
+        self.cycle_duration_ms: float            = 0.0
+        self.last_analyst_signal: dict           = {}
+        self.last_edgar_alerts:  List[dict]     = []
 
 
-state      = HypervisorState()
-classifier = RegimeClassifier()
-allocator  = RegimeAllocator(total_capital=INITIAL_CAPITAL_USD)
-risk_mgr   = RiskManager(initial_capital=INITIAL_CAPITAL_USD)
+state           = HypervisorState()
+classifier      = RegimeClassifier()
+allocator       = RegimeAllocator(total_capital=INITIAL_CAPITAL_USD)
+risk_mgr        = RiskManager(initial_capital=INITIAL_CAPITAL_USD)
+execution_risk  = ExecutionRiskChecker(paper_trading=PAPER_TRADING)
 
 
 # ── Telegram notification helper ──────────────────────────────────────────────
@@ -173,6 +181,105 @@ def _run_quarterly_sweep() -> None:
     _tg_send(msg)
 
 
+# ── EDGAR watchlist filing monitor ───────────────────────────────────────────
+
+EDGAR_SCAN_INTERVAL_SEC = int(os.environ.get("EDGAR_SCAN_INTERVAL_SEC", 1800))  # 30 min
+EDGAR_ALERT_MIN_SCORE   = 50
+
+
+async def _edgar_watchlist_scan() -> None:
+    """
+    Scan EDGAR for significant recent filings across all watchlist tickers.
+    High-scoring filings (>= EDGAR_ALERT_MIN_SCORE) trigger Telegram alerts.
+    Results stored in state.last_edgar_alerts for the /edgar-alerts endpoint.
+    """
+    try:
+        from data.feeds.edgar_feed import (
+            EdgarWatchlistMonitor, MONITORED_FORM_TYPES, parse_8k_with_llm,
+        )
+    except ImportError:
+        logger.warning("edgar_feed not available — EDGAR watchlist scan skipped")
+        return
+
+    if not state.watchlist:
+        return
+
+    monitor = EdgarWatchlistMonitor()
+    alerts: List[dict] = []
+
+    for ticker in list(state.watchlist):
+        try:
+            cik = await asyncio.to_thread(monitor.get_cik_for_ticker, ticker)
+            if cik is None:
+                continue   # crypto or unknown ticker
+
+            filings = await asyncio.to_thread(
+                monitor.get_recent_filings, cik, MONITORED_FORM_TYPES, 2
+            )
+            for filing in filings:
+                acc = filing["accession_number"]
+                excerpt = await asyncio.to_thread(
+                    monitor.get_filing_text_excerpt, acc, cik
+                )
+                significance = monitor.score_filing_significance(
+                    filing["form_type"], excerpt
+                )
+                if significance["score"] >= EDGAR_ALERT_MIN_SCORE:
+                    alert = {
+                        "ticker":   ticker,
+                        "form_type": filing["form_type"],
+                        "date":     filing["filing_date"],
+                        "score":    significance["score"],
+                        "keywords": significance["keywords_matched"],
+                        "excerpt":  excerpt[:200],
+                    }
+                    # LLM enrichment for high-scoring 8-Ks
+                    if filing["form_type"] == "8-K" and significance["score"] >= 60:
+                        try:
+                            llm_context = await asyncio.to_thread(
+                                parse_8k_with_llm, excerpt, ticker, acc
+                            )
+                            alert["llm_context"] = llm_context
+                        except Exception:
+                            pass
+                    alerts.append(alert)
+        except Exception as exc:
+            logger.warning(f"EDGAR scan failed for {ticker}: {exc}")
+
+    state.last_edgar_alerts = alerts
+
+    if alerts:
+        top = sorted(alerts, key=lambda x: x["score"], reverse=True)[:3]
+        for a in top:
+            kw_str = ", ".join(a["keywords"]) if a["keywords"] else "—"
+            llm_info = ""
+            if "llm_context" in a:
+                ctx = a["llm_context"]
+                llm_info = f"\nEvent: {ctx.get('event_type')} | {ctx.get('price_direction')} | {ctx.get('magnitude')}"
+            _tg_send(
+                f"EDGAR ALERT [{a['ticker']}] {a['form_type']} "
+                f"(score: {a['score']:.0f})\n"
+                f"Date: {a['date']}\n"
+                f"Keywords: {kw_str}"
+                f"{llm_info}\n"
+                f"{a['excerpt']}"
+            )
+        logger.info(f"EDGAR watchlist scan: {len(alerts)} significant filings found")
+    else:
+        logger.debug("EDGAR watchlist scan: no significant filings")
+
+
+async def _edgar_watchlist_loop() -> None:
+    """Background loop running _edgar_watchlist_scan every EDGAR_SCAN_INTERVAL_SEC."""
+    await asyncio.sleep(30)   # brief delay after startup
+    while True:
+        try:
+            await _edgar_watchlist_scan()
+        except Exception as exc:
+            logger.error(f"EDGAR watchlist loop error: {exc}", exc_info=True)
+        await asyncio.sleep(EDGAR_SCAN_INTERVAL_SEC)
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -184,7 +291,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Workers  : {list(WORKER_REGISTRY.keys())}")
     logger.info("=" * 60)
 
-    task = asyncio.create_task(orchestration_loop())
+    task         = asyncio.create_task(orchestration_loop())
+    edgar_task   = asyncio.create_task(_edgar_watchlist_loop())
 
     # Quarterly profit sweep — 7th of Jan / Apr / Jul / Oct
     scheduler = None
@@ -205,8 +313,13 @@ async def lifespan(app: FastAPI):
     yield
 
     task.cancel()
+    edgar_task.cancel()
     try:
         await task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await edgar_task
     except asyncio.CancelledError:
         pass
     if scheduler:
@@ -229,6 +342,7 @@ async def orchestration_loop():
         except Exception as exc:
             logger.error(f"Cycle {state.cycle_count} failed: {exc}", exc_info=True)
         elapsed   = time.time() - cycle_start
+        state.cycle_duration_ms = elapsed * 1000.0
         sleep_for = max(0, CYCLE_INTERVAL_SEC - elapsed)
         logger.info(f"Cycle {state.cycle_count} done in {elapsed:.1f}s. Next in {sleep_for:.0f}s.")
         await asyncio.sleep(sleep_for)
@@ -246,6 +360,10 @@ async def _run_cycle():
     # Step 2: Pull status
     await _pull_worker_status(healthy)
     _reconcile_capital()
+
+    # Step 2.5: Pre-fetch data sources with per-source timing for latency monitoring.
+    # Populates the market_data 5-min cache so classifier.classify_sync hits cache.
+    await _prefetch_and_time_data_sources()
 
     # Step 3: Classify regime
     try:
@@ -295,8 +413,29 @@ async def _run_cycle():
     # Step 6: Broadcast regime
     await _broadcast_regime(healthy, state.current_regime, state.regime_confidence)
 
-    # Step 7: Send allocations
-    await _send_allocations(alloc.allocations)
+    # Step 6.5: Pull signals and run pre-execution risk checks
+    worker_signals  = await _pull_worker_signals(healthy, alloc.allocations)
+    blocked_workers = _run_execution_risk_checks(worker_signals, alloc.allocations)
+    lat_result      = execution_risk.check_latency()
+    state.execution_risk_state = {
+        "slippage":        dict(execution_risk.last_slippage_results),
+        "liquidity":       dict(execution_risk.last_liquidity_results),
+        "latency":         lat_result,
+        "blocked_workers": list(blocked_workers),
+        "cycle_count":     state.cycle_count,
+    }
+
+    # Step 7: Send allocations — skip blocked workers (live mode) or all on latency BLOCK
+    if lat_result["flag"] == "BLOCK":
+        logger.warning("execution_risk: latency BLOCK — deferring all allocations this cycle")
+        allocations_to_send: Dict[str, float] = {}
+    elif blocked_workers:
+        allocations_to_send = {
+            w: a for w, a in alloc.allocations.items() if w not in blocked_workers
+        }
+    else:
+        allocations_to_send = alloc.allocations
+    await _send_allocations(allocations_to_send)
 
     # Step 8: Resume workers that have allocation
     if state.current_regime not in DEFENSIVE_REGIMES:
@@ -409,6 +548,137 @@ async def _resume_worker(worker: str):
                 await client.post(f"{url}/resume")
         except Exception:
             pass
+
+
+async def _prefetch_and_time_data_sources() -> None:
+    """
+    Warm the market-data cache and record per-source fetch latency.
+    Runs four asyncio.to_thread calls sequentially so each source is
+    timed independently. On cache hit every call returns in <10 ms.
+    """
+    import time as _t
+
+    async def _timed(source: str, fn) -> None:
+        t0 = _t.monotonic()
+        try:
+            await asyncio.to_thread(fn)
+        except Exception as exc:
+            logger.debug("data prefetch source=%s err=%s", source, exc)
+        execution_risk.record_source_latency(source, (_t.monotonic() - t0) * 1000.0)
+
+    def _yf():
+        from data.feeds.market_data import (
+            get_vix, get_dxy, get_bdi_slope, get_defense_momentum, get_gold_oil_ratio,
+        )
+        get_vix(); get_dxy(); get_bdi_slope(); get_defense_momentum(); get_gold_oil_ratio()
+
+    def _fred():
+        from data.feeds.market_data import get_yield_curve
+        get_yield_curve()
+
+    def _gdelt():
+        # get_gdelt_tension_score is cached at 600 s TTL in market_data._cached.
+        # Timing this call captures actual GDELT network latency on cache miss.
+        from data.feeds.market_data import get_gdelt_tension_score
+        get_gdelt_tension_score()
+
+    def _okx():
+        from data.feeds.market_data import get_crypto_funding_rate
+        get_crypto_funding_rate("BTC-USDT-SWAP")
+
+    await _timed("yfinance", _yf)
+    await _timed("fred",     _fred)
+    await _timed("gdelt",    _gdelt)
+    await _timed("okx",      _okx)
+
+
+async def _pull_worker_signals(
+    workers: List[str], allocations: Dict[str, float]
+) -> Dict[str, List[dict]]:
+    """
+    POST /signal on each healthy worker that has a non-trivial allocation.
+    The analyst worker receives a full context payload; all others get {}.
+    Returns {worker: [signal_dict, ...]}. Failures are logged at DEBUG.
+    """
+    results: Dict[str, List[dict]] = {}
+
+    # Build analyst context payload once — used only for the "analyst" worker.
+    analyst_payload = {
+        "regime":            state.current_regime,
+        "confidence":        state.regime_confidence,
+        "war_premium_score": state.war_premium_score,
+        "worker_states":     {
+            w: {
+                "pnl":          state.worker_pnl.get(w, 0.0),
+                "sharpe":       state.worker_sharpe.get(w),
+                "allocated_usd": state.worker_allocated.get(w, 0.0),
+            }
+            for w in WORKER_REGISTRY
+            if w != "analyst"
+        },
+        "watchlist":     state.watchlist,
+        "cycle_number":  state.cycle_count,
+        "paper_trading": PAPER_TRADING,
+    }
+
+    async with httpx.AsyncClient(timeout=WORKER_TIMEOUT_SEC) as client:
+        for worker in workers:
+            if allocations.get(worker, 0) < MIN_TRADE_SIZE_USD:
+                continue
+            url = WORKER_REGISTRY.get(worker)
+            if not url:
+                continue
+            payload = analyst_payload if worker == "analyst" else {}
+            try:
+                resp = await client.post(f"{url}/signal", json=payload)
+                if resp.status_code == 200:
+                    sigs = resp.json()
+                    if isinstance(sigs, list):
+                        results[worker] = sigs
+                        if worker == "analyst" and sigs:
+                            state.last_analyst_signal = sigs[0]
+            except Exception as exc:
+                logger.debug("  %s /signal failed: %s", worker, exc)
+    return results
+
+
+def _run_execution_risk_checks(
+    worker_signals: Dict[str, List[dict]],
+    allocations: Dict[str, float],
+) -> set:
+    """
+    Run slippage + liquidity checks for each worker's signals.
+    Stores results in execution_risk.last_slippage_results / last_liquidity_results.
+    Returns the set of worker names that have BLOCK-level results in live mode.
+    Advisory-only symbols (CROSS_EXCHANGE_ARB) and empty symbols are skipped.
+    """
+    blocked_workers: set = set()
+
+    for worker, signals in worker_signals.items():
+        order_size_usd = allocations.get(worker, 0.0)
+        worker_blocked = False
+        for sig in signals[:2]:   # check up to 2 signals per worker
+            symbol = sig.get("symbol", "")
+            if not symbol or symbol in ("CROSS_EXCHANGE_ARB",):
+                continue
+            side = sig.get("direction", "long")
+            slip = execution_risk.check_slippage(
+                symbol=symbol,
+                signal_price=0.0,
+                side=side,
+                regime=state.current_regime,
+            )
+            liq = execution_risk.check_liquidity(
+                symbol=symbol,
+                order_size_usd=order_size_usd,
+            )
+            if slip.get("flag") == "BLOCK" or liq.get("flag") == "BLOCK":
+                worker_blocked = True
+
+        if worker_blocked and not PAPER_TRADING:
+            blocked_workers.add(worker)
+
+    return blocked_workers
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -547,3 +817,75 @@ async def add_to_watchlist(body: dict):
         state.watchlist.append(ticker)
         logger.info(f"Watchlist: added {ticker}")
     return {"watchlist": state.watchlist}
+
+
+@app.get("/execution-risk")
+async def execution_risk_state():
+    """Latest pre-execution risk check results from the most recent cycle."""
+    return state.execution_risk_state
+
+
+@app.get("/thesis")
+async def get_thesis():
+    """Latest analyst signal/thesis — read by Grafana thesis panel and Telegram bot."""
+    return state.last_analyst_signal
+
+
+@app.get("/edgar-alerts")
+async def get_edgar_alerts():
+    """Latest EDGAR significant filing alerts (updated every 30 min). Used by Grafana and analyst worker."""
+    return {"alerts": state.last_edgar_alerts, "count": len(state.last_edgar_alerts)}
+
+
+_ALL_REGIMES = [
+    "WAR_PREMIUM", "CRISIS_ACUTE", "BEAR_RECESSION",
+    "BULL_FROTHY", "REGIME_CHANGE", "SHADOW_DRIFT", "BULL_CALM",
+]
+
+
+@app.get("/metrics")
+def hypervisor_metrics():
+    """Prometheus text metrics for the hypervisor and execution risk gauges."""
+    lines = [
+        # ── Hypervisor internals ─────────────────────────────────────────────
+        f'mara_hypervisor_cycle_count {state.cycle_count}',
+        f'mara_hypervisor_capital_usd {state.total_capital:.2f}',
+        f'mara_hypervisor_free_capital_usd {state.free_capital:.2f}',
+        f'mara_hypervisor_halted {1 if state.halted else 0}',
+        f'mara_hypervisor_workers_healthy {sum(1 for h in state.worker_health.values() if h)}',
+        # ── Regime state ─────────────────────────────────────────────────────
+        f'mara_regime_confidence {state.regime_confidence:.4f}',
+        f'mara_war_premium_score {state.war_premium_score:.2f}',
+        f'mara_cycle_duration_ms {state.cycle_duration_ms:.1f}',
+    ]
+
+    # One time series per regime label; active=1, all others=0
+    for regime in _ALL_REGIMES:
+        val = 1 if regime == state.current_regime else 0
+        lines.append(f'mara_regime_label{{regime="{regime}"}} {val}')
+
+    # ── Per-worker gauges ─────────────────────────────────────────────────────
+    for worker, alloc_usd in state.allocations.items():
+        lines.append(f'mara_worker_allocated_usd{{worker="{worker}"}} {alloc_usd:.2f}')
+
+    for worker, pnl in state.worker_pnl.items():
+        lines.append(f'mara_worker_pnl_usd{{worker="{worker}"}} {pnl:.4f}')
+
+    for worker in WORKER_REGISTRY:
+        sharpe = state.worker_sharpe.get(worker) or 0.0
+        lines.append(f'mara_worker_sharpe{{worker="{worker}"}} {sharpe:.4f}')
+        wstatus = state.worker_status.get(worker, {})
+        lines.append(
+            f'mara_worker_open_positions{{worker="{worker}"}} '
+            f'{int(wstatus.get("open_positions", 0))}'
+        )
+        paused_int = 1 if wstatus.get("paused", False) else 0
+        lines.append(f'mara_worker_paused{{worker="{worker}"}} {paused_int}')
+
+    # ── Execution risk gauges (slippage, fill_rate, api_latency_p95) ─────────
+    exec_risk_text = execution_risk.prometheus_metrics()
+    if exec_risk_text:
+        lines.append(exec_risk_text.rstrip("\n"))
+
+    content = "\n".join(lines) + "\n"
+    return Response(content=content, media_type="text/plain")

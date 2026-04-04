@@ -232,12 +232,38 @@ def resume():
 
 @app.get("/metrics")
 def metrics():
-    active  = 0 if state.paused else 1
-    pnl     = state.mark_to_market_pnl()
-    content = (
-        f'mara_worker_active{{worker="core_dividends"}} {active}\n'
-        f'mara_core_dividends_pnl_usd {pnl:.4f}\n'
-        f'mara_core_dividends_open_positions {state.open_positions()}\n'
-        f'mara_core_dividends_allocated_usd {state.allocated_usd:.2f}\n'
-    )
+    active     = 0 if state.paused else 1
+    paused_int = 1 if state.paused else 0
+    pnl        = state.mark_to_market_pnl()
+    n_pos      = state.open_positions()
+
+    lines = [
+        # ── Standard labeled gauges ──────────────────────────────────────────
+        f'mara_worker_pnl_usd{{worker="core_dividends"}} {pnl:.4f}',
+        f'mara_worker_allocated_usd{{worker="core_dividends"}} {state.allocated_usd:.2f}',
+        f'mara_worker_sharpe{{worker="core_dividends"}} 0.0',
+        f'mara_worker_open_positions{{worker="core_dividends"}} {n_pos}',
+        f'mara_worker_paused{{worker="core_dividends"}} {paused_int}',
+        # ── Legacy ───────────────────────────────────────────────────────────
+        f'mara_worker_active{{worker="core_dividends"}} {active}',
+        f'mara_core_dividends_pnl_usd {pnl:.4f}',
+        f'mara_core_dividends_open_positions {n_pos}',
+        f'mara_core_dividends_allocated_usd {state.allocated_usd:.2f}',
+    ]
+
+    # ── Per-position detail (SCHD / VYM) ────────────────────────────────────
+    for ticker, pos in state._positions.items():
+        sym = ticker.replace('"', "")
+        lines += [
+            f'mara_position_size_usd{{worker="core_dividends",symbol="{sym}"}} {pos["alloc_usd"]:.2f}',
+            f'mara_position_side{{worker="core_dividends",symbol="{sym}"}} 1',   # always long
+            f'mara_position_entry_price{{worker="core_dividends",symbol="{sym}"}} {pos["entry_price"]:.4f}',
+            # MTM PnL computed at /status time; 0.0 here to avoid blocking yfinance call in metrics path
+            f'mara_position_unrealized_pnl_usd{{worker="core_dividends",symbol="{sym}"}} 0.0',
+            f'mara_position_age_cycles{{worker="core_dividends",symbol="{sym}"}} 0.0',
+            f'mara_observed_slippage_bps{{worker="core_dividends",symbol="{sym}",paper_mode="true"}} 0',
+            f'mara_fill_rate_observed{{worker="core_dividends",symbol="{sym}",paper_mode="true"}} 1.0',
+        ]
+
+    content = "\n".join(lines) + "\n"
     return Response(content=content, media_type="text/plain")

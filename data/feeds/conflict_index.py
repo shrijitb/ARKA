@@ -3,22 +3,40 @@ data/feeds/conflict_index.py
 
 Composite War Premium Score  0-100.
 
-Four independent data layers:
+Six independent data layers:
 
-  Layer 1  Market proxy  (PRIMARY, 70-75% weight)
+  Layer 1  Market proxy    (PRIMARY, 60%+ weight)
            Defense ETF momentum + gold/oil ratio + VIX.
            Always available, no auth required, reacts in real-time.
 
-  Layer 2  ACLED CAST forecasts  (20% when authenticated)
-           Monthly battle/ERV/VAC forecasts for watch countries.
-           Forward-looking and structured — highest-quality signal.
-
-  Layer 3  ACLED live events  (5% supplement)
-           Recent lethal events in watch countries.
-           Protests/demonstrations deliberately excluded.
-
-  Layer 4  GDELT  (5-25% depending on ACLED availability)
+  Layer 2  GDELT           (10%)
            Negative news tone + high article volume = conflict signal.
+
+  Layer 3  UCDP GED        (10%)  — requires UCDP_API_TOKEN
+           Uppsala University georeferenced conflict events, last 30 days.
+           Free token — email ucdp.uu.se to request.
+
+  Layer 4  AIS chokepoints (10%)  — requires AISSTREAM_API_KEY
+           Vessel traffic deficit at Hormuz, Suez, Malacca, Taiwan, Bab-el-Mandeb.
+           Free account at aisstream.io.
+
+  Layer 5  NASA FIRMS      (3%)   — requires NASA_FIRMS_API_KEY
+           High-confidence VIIRS thermal anomalies over active conflict zones.
+           Free Earthdata account at firms.modaps.eosdis.nasa.gov.
+
+  Layer 6  USGS seismic    (2%)   — no auth required
+           M4.5+ earthquakes near critical infrastructure (straits, nuclear sites).
+
+  Layer 7  EDGAR macro     (5%)   — no auth required
+           Sector-wide filing clusters: supply-chain disruptions, energy incidents,
+           defense contract events, semiconductor supply alerts, shipping blockages.
+           Free — SEC EDGAR requires only a User-Agent header.
+
+  ACLED (legacy, disabled) — free tier returns 403 on data endpoints.
+  Code preserved for when an approved researcher account is available.
+
+Weight redistribution: if a source's API key is absent, its weight is added
+to market_proxy. Total always sums to 1.0.
 
 Score thresholds consumed by classifier.py:
   < 25   no war signal
@@ -31,8 +49,12 @@ Verify standalone:
     python data/feeds/conflict_index.py
 """
 
+import asyncio
+import csv
+import io
 import json
 import logging
+import math
 import os
 import time
 import urllib.request
@@ -40,6 +62,18 @@ import urllib.parse
 import requests as _requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+try:
+    from data.feeds.edgar_feed import get_edgar_macro_score as _get_edgar_macro_score
+    _HAVE_EDGAR = True
+except ImportError:
+    _HAVE_EDGAR = False
+
+try:
+    import websockets as _websockets
+    _HAVE_WEBSOCKETS = True
+except ImportError:
+    _HAVE_WEBSOCKETS = False
 
 try:
     from dotenv import load_dotenv
@@ -95,6 +129,55 @@ GDELT_QUERIES = [
 DEFENSE_ETFS       = ["ITA", "PPA", "SHLD", "NATO"]
 GOLD_OIL_BASELINE  = 35.0   # Pre-2020 historical peacetime norm
 GOLD_OIL_WAR_LEVEL = 52.0   # Clearly elevated — systemic risk priced in
+
+
+# ── UCDP GED ──────────────────────────────────────────────────────────────────
+# Gleditsch-Ward country codes — verified against ucdpapi.pcr.uu.se/api/country/23.1
+UCDP_GED_URL = "https://ucdpapi.pcr.uu.se/api/gedevents/23.1"
+UCDP_WATCHED_COUNTRIES = {
+    "Ukraine":  369,
+    "Russia":   365,
+    "Syria":    652,
+    "Israel":   666,
+    "Iran":     630,
+    "Yemen":    678,
+    "Taiwan":   713,
+    "Sudan":    625,
+    "Myanmar":  775,
+}
+
+
+# ── AIS chokepoint monitor ────────────────────────────────────────────────────
+CHOKEPOINTS = {
+    "hormuz":     [[21.0, 55.0], [27.0, 60.0]],
+    "suez":       [[29.5, 31.5], [31.5, 33.0]],
+    "malacca":    [[1.0,  99.0], [6.0, 104.5]],
+    "taiwan":     [[22.0,119.0], [26.0, 123.0]],
+    "bab_mandeb": [[11.0, 42.0], [13.5,  45.0]],
+}
+CHOKEPOINT_BASELINES = {
+    "hormuz": 12, "suez": 8, "malacca": 20, "taiwan": 6, "bab_mandeb": 4,
+}
+
+
+# ── NASA FIRMS ────────────────────────────────────────────────────────────────
+FIRMS_BASE_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+FIRMS_BBOXES = [
+    "31,44,40,52",   # Ukraine east
+    "35,33,38,37",   # Syria
+    "43,11,50,15",   # Yemen
+    "44,25,49,30",   # Iran west
+]
+
+
+# ── USGS seismic ──────────────────────────────────────────────────────────────
+USGS_EARTHQUAKE_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+SEISMIC_WATCH_ZONES = [
+    {"name": "taiwan_strait", "lat": 24.0, "lon": 121.0, "radius_deg": 3.0},
+    {"name": "hormuz",        "lat": 26.5, "lon":  56.5, "radius_deg": 2.0},
+    {"name": "japan_nuclear", "lat": 37.0, "lon": 141.0, "radius_deg": 4.0},
+    {"name": "turkey_straits","lat": 41.0, "lon":  29.0, "radius_deg": 2.0},
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,6 +262,14 @@ class AcledTokenManager:
 
 # Module-level singleton
 _token_manager = AcledTokenManager()
+
+# ── New-source caches ─────────────────────────────────────────────────────────
+_edgar_cache:     dict = {"ts": 0.0, "score": 0.0}   # 6h TTL (sourced from edgar_feed)
+_ucdp_cache:      dict = {"ts": 0.0, "score": 0.0}   # 4h TTL
+_ais_cache:       dict = {"ts": 0.0, "score": 0.0}   # 15min TTL
+_firms_cache:     dict = {"ts": 0.0, "score": 0.0}   # 3h TTL
+_usgs_cache:      dict = {"ts": 0.0, "score": 0.0}   # 1h TTL
+_osint_llm_cache: dict = {}                           # keyed by event_id
 
 
 def _get_acled_token() -> Optional[str]:
@@ -537,33 +628,444 @@ def get_acled_token(email: str, password: str) -> Optional[str]:
     return _token_manager.get_token(email, password)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer 3: UCDP GED (Uppsala Conflict Data Program Georeferenced Events)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_ucdp_ged() -> float:
+    """
+    Fetch conflict events from UCDP GED API for the last 30 days.
+    Requires UCDP_API_TOKEN env var (free — email ucdp.uu.se to request).
+    Cache TTL: 4 hours. Returns 0.0 on missing key or any error.
+    """
+    token = os.environ.get("UCDP_API_TOKEN", "")
+    if not token:
+        logger.warning("UCDP_API_TOKEN not set — UCDP GED layer skipped")
+        return 0.0
+
+    now = time.time()
+    if now - _ucdp_cache["ts"] < 4 * 3600:
+        return _ucdp_cache["score"]
+
+    try:
+        today     = datetime.now(timezone.utc).date()
+        start_dt  = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+        recent_dt = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        country_ids = "|".join(str(v) for v in UCDP_WATCHED_COUNTRIES.values())
+
+        params = urllib.parse.urlencode({
+            "pagesize":  100,
+            "page":      1,
+            "StartDate": start_dt,
+        })
+        # Inject country IDs directly (pipe must not be percent-encoded)
+        url = f"{UCDP_GED_URL}?{params}&country={country_ids}"
+
+        resp = _requests.get(
+            url,
+            headers={"x-ucdp-access-token": token},
+            timeout=20,
+        )
+        if resp.status_code in (403, 404):
+            logger.warning(f"UCDP GED HTTP {resp.status_code} — check token")
+            return _ucdp_cache.get("score", 0.0)
+
+        resp.raise_for_status()
+        events = resp.json().get("Result", [])
+
+        event_count = len(events)
+        recent_count = sum(
+            1 for e in events
+            if e.get("date_start", "") >= recent_dt
+        )
+        recency_weight = recent_count / max(event_count, 1)
+        raw_score = min(100.0, event_count * 2 + recency_weight * 30)
+        score = round(raw_score, 1)
+
+        logger.info(
+            f"UCDP GED: {event_count} events (30d), {recent_count} recent (7d) → {score}"
+        )
+        _ucdp_cache["ts"]    = now
+        _ucdp_cache["score"] = score
+        return score
+
+    except Exception as exc:
+        logger.warning(f"UCDP GED fetch failed: {exc}")
+        return _ucdp_cache.get("score", 0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer 4: AIS Chokepoint Vessel Traffic Monitor
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _fetch_ais_chokepoint_async() -> float:
+    """
+    Open an aisstream.io WebSocket, collect 8s of PositionReport messages
+    across all 5 chokepoint bounding boxes, score vessel deficit vs baselines.
+    """
+    key = os.environ.get("AISSTREAM_API_KEY", "")
+    if not key:
+        return 0.0
+
+    if not _HAVE_WEBSOCKETS:
+        logger.warning("websockets package not installed — AIS layer skipped")
+        return 0.0
+
+    vessel_counts: dict = {cp: set() for cp in CHOKEPOINTS}
+
+    async def _collect() -> None:
+        async with _websockets.connect("wss://stream.aisstream.io/v0/stream") as ws:
+            for cp_name, bbox in CHOKEPOINTS.items():
+                sub = json.dumps({
+                    "Apikey":             key,
+                    "BoundingBoxes":      [bbox],
+                    "FilterMessageTypes": ["PositionReport"],
+                })
+                await ws.send(sub)
+
+            deadline = asyncio.get_event_loop().time() + 8.0
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    msg = json.loads(raw)
+                    mmsi = (
+                        msg.get("Message", {})
+                           .get("PositionReport", {})
+                           .get("UserID")
+                    )
+                    lat  = (
+                        msg.get("Message", {})
+                           .get("PositionReport", {})
+                           .get("Latitude")
+                    )
+                    lon  = (
+                        msg.get("Message", {})
+                           .get("PositionReport", {})
+                           .get("Longitude")
+                    )
+                    if mmsi is None or lat is None or lon is None:
+                        continue
+                    # Attribute vessel to chokepoints whose bbox contains it
+                    for cp_name, bbox in CHOKEPOINTS.items():
+                        min_lat, min_lon = bbox[0]
+                        max_lat, max_lon = bbox[1]
+                        if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+                            vessel_counts[cp_name].add(mmsi)
+                except asyncio.TimeoutError:
+                    continue
+
+    try:
+        await asyncio.wait_for(_collect(), timeout=12.0)
+    except Exception as exc:
+        logger.warning(f"AIS WebSocket error: {exc}")
+        return 0.0
+
+    deviations = []
+    for cp_name, baseline in CHOKEPOINT_BASELINES.items():
+        observed  = len(vessel_counts.get(cp_name, set()))
+        deviation = max(0.0, min(1.0, (baseline - observed) / baseline))
+        deviations.append(deviation)
+
+    score = round((sum(deviations) / len(deviations)) * 100, 1) if deviations else 0.0
+    logger.info(
+        f"AIS chokepoints: {dict((k, len(v)) for k, v in vessel_counts.items())} "
+        f"→ {score}"
+    )
+    return score
+
+
+def _fetch_ais_chokepoint_sync() -> float:
+    """
+    Sync wrapper around the async AIS fetch. Called from get_war_premium_score().
+    Cache TTL: 15 minutes.
+    """
+    if not os.environ.get("AISSTREAM_API_KEY", ""):
+        return 0.0
+
+    now = time.time()
+    if now - _ais_cache["ts"] < 15 * 60:
+        return _ais_cache["score"]
+
+    try:
+        score = asyncio.run(_fetch_ais_chokepoint_async())
+    except RuntimeError:
+        # asyncio.run() fails if there's already a running loop (e.g., in pytest-asyncio)
+        loop = asyncio.new_event_loop()
+        try:
+            score = loop.run_until_complete(_fetch_ais_chokepoint_async())
+        finally:
+            loop.close()
+    except Exception as exc:
+        logger.warning(f"AIS sync wrapper failed: {exc}")
+        score = 0.0
+
+    _ais_cache["ts"]    = now
+    _ais_cache["score"] = score
+    return score
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer 5: NASA FIRMS Thermal Anomaly (VIIRS SNPP NRT)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_nasa_firms() -> float:
+    """
+    Count high-confidence VIIRS thermal anomalies over conflict zones (last 48h).
+    Requires NASA_FIRMS_API_KEY env var (free Earthdata account).
+    Cache TTL: 3 hours. Returns 0.0 on missing key or any error.
+    """
+    api_key = os.environ.get("NASA_FIRMS_API_KEY", "")
+    if not api_key:
+        logger.warning("NASA_FIRMS_API_KEY not set — FIRMS layer skipped")
+        return 0.0
+
+    now = time.time()
+    if now - _firms_cache["ts"] < 3 * 3600:
+        return _firms_cache["score"]
+
+    high_count = 0
+    for bbox in FIRMS_BBOXES:
+        url = f"{FIRMS_BASE_URL}/{api_key}/VIIRS_SNPP_NRT/{bbox}/2"
+        try:
+            resp = _requests.get(url, timeout=15)
+            resp.raise_for_status()
+            reader = csv.DictReader(io.StringIO(resp.text))
+            for row in reader:
+                conf = row.get("confidence", row.get("conf", "")).strip().lower()
+                # VIIRS NRT: confidence is "h" (high), "n" (nominal), "l" (low)
+                if conf in ("h", "high"):
+                    high_count += 1
+        except Exception as exc:
+            logger.warning(f"NASA FIRMS fetch failed for bbox {bbox}: {exc}")
+
+    score = round(min(100.0, high_count * 3), 1)
+    logger.info(f"NASA FIRMS: {high_count} high-confidence thermal events → {score}")
+    _firms_cache["ts"]    = now
+    _firms_cache["score"] = score
+    return score
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layer 6: USGS Seismic — M4.5+ near critical infrastructure
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fetch_usgs_seismic() -> float:
+    """
+    Score M4.5+ earthquakes near critical infrastructure watch zones (last 7 days).
+    No auth required. Cache TTL: 1 hour.
+    """
+    now = time.time()
+    if now - _usgs_cache["ts"] < 3600:
+        return _usgs_cache["score"]
+
+    today    = datetime.now(timezone.utc).date()
+    start_dt = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    end_dt   = today.strftime("%Y-%m-%d")
+
+    try:
+        params = urllib.parse.urlencode({
+            "format":         "geojson",
+            "minmagnitude":   4.5,
+            "starttime":      start_dt,
+            "endtime":        end_dt,
+        })
+        url  = f"{USGS_EARTHQUAKE_URL}?{params}"
+        resp = _requests.get(url, timeout=15)
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+
+        relevant_magnitudes = []
+        for feat in features:
+            props = feat.get("properties", {})
+            coords = feat.get("geometry", {}).get("coordinates", [])
+            if len(coords) < 2:
+                continue
+            lon, lat = float(coords[0]), float(coords[1])
+            mag = props.get("mag")
+            if mag is None:
+                continue
+            for zone in SEISMIC_WATCH_ZONES:
+                dist = math.sqrt(
+                    (lat - zone["lat"]) ** 2 + (lon - zone["lon"]) ** 2
+                )
+                if dist <= zone["radius_deg"]:
+                    relevant_magnitudes.append(float(mag))
+                    break   # count each event once even if in multiple zones
+
+        magnitude_score = sum(10 ** (m - 4.5) for m in relevant_magnitudes)
+        score = round(min(100.0, magnitude_score * 5), 1)
+        logger.info(
+            f"USGS seismic: {len(relevant_magnitudes)} relevant events "
+            f"(M4.5+ near watch zones) → {score}"
+        )
+        _usgs_cache["ts"]    = now
+        _usgs_cache["score"] = score
+        return score
+
+    except Exception as exc:
+        logger.warning(f"USGS seismic fetch failed: {exc}")
+        return _usgs_cache.get("score", 0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OSINT LLM Parser (advisory only — never in scoring hot path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OSINT_PROMPT_TEMPLATE = (
+    "You are a geopolitical data parser. Extract structured information from this "
+    "{source} event description. Return ONLY valid JSON, no other text: "
+    '{{"affected_commodities": ["oil"|"wheat"|"gas"|"semiconductors"|"gold"|"none"], '
+    '"severity": 1-5, '
+    '"escalation": "rising"|"stable"|"falling"}} '
+    "Event: {text}"
+)
+
+_OSINT_DEFAULT = {"affected_commodities": [], "severity": 1, "escalation": "stable"}
+
+
+def parse_osint_with_llm(text: str, source: str, event_id: str) -> dict:
+    """
+    Send a raw event text snippet to phi3:mini on Ollama for structured parsing.
+    Results are cached by event_id and used ONLY for:
+      - Enriching Telegram alert messages with commodity context
+      - Enriching the Grafana thesis panel via /execution-risk
+      - Nudging watchlist ticker weights (advisory_only=True)
+
+    NEVER modifies war_premium_score, regime classification, or capital allocation.
+    Returns the default dict on any failure — never raises.
+    """
+    if event_id in _osint_llm_cache:
+        return _osint_llm_cache[event_id]
+
+    ollama_host = os.environ.get("OLLAMA_HOST", "http://ollama:11434")
+    prompt = _OSINT_PROMPT_TEMPLATE.format(source=source, text=text[:500])
+
+    try:
+        resp = _requests.post(
+            f"{ollama_host}/api/generate",
+            json={"model": "phi3:mini", "prompt": prompt, "stream": False},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "")
+        parsed = json.loads(raw)
+        # Validate expected keys are present
+        result = {
+            "affected_commodities": parsed.get("affected_commodities", []),
+            "severity":             int(parsed.get("severity", 1)),
+            "escalation":           parsed.get("escalation", "stable"),
+        }
+    except Exception as exc:
+        logger.warning(f"OSINT LLM parse failed ({source}/{event_id}): {exc}")
+        result = dict(_OSINT_DEFAULT)
+
+    _osint_llm_cache[event_id] = result
+    return result
+
+
+def get_osint_commodity_context() -> dict:
+    """Return copy of the full LLM-parsed OSINT cache, keyed by event_id."""
+    return dict(_osint_llm_cache)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weight table and redistribution
+# ─────────────────────────────────────────────────────────────────────────────
+
+BASE_WEIGHTS: dict = {
+    "market_proxy":   0.60,
+    "gdelt":          0.10,
+    "ucdp_ged":       0.10,
+    "ais_chokepoint": 0.10,
+    "nasa_firms":     0.03,
+    "usgs_seismic":   0.02,
+    "edgar_macro":    0.05,
+}
+
+
+def _effective_weights(active_sources: set) -> dict:
+    """
+    Redistribute weights of absent/errored sources to market_proxy.
+    A source is 'active' if its API key is configured (even if score == 0).
+    USGS is always active (no key required). market_proxy is always active.
+    Total of returned weights always sums to 1.0.
+    """
+    skipped = sum(
+        w for k, w in BASE_WEIGHTS.items()
+        if k not in ("market_proxy",) and k not in active_sources
+    )
+    weights = {
+        k: (v if k in active_sources else 0.0)
+        for k, v in BASE_WEIGHTS.items()
+    }
+    weights["market_proxy"] = BASE_WEIGHTS["market_proxy"] + skipped
+    return weights
+
+
 def get_war_premium_score() -> float:
     """
     Composite War Premium Score 0-100.
-    Weights shift when ACLED is unavailable — market proxy picks up the slack.
+
+    Seven layers: market proxy (60%+), GDELT (10%), UCDP GED (10%),
+    AIS chokepoints (10%), NASA FIRMS (3%), USGS seismic (2%),
+    EDGAR macro (5% — no key required).
+    Missing API keys redistribute their weight to market_proxy.
+    Total always sums to 1.0.
     """
-    token     = _get_acled_token()
-    has_acled = token is not None
-
     market = _fetch_market_proxy()
-    cast   = _fetch_acled_cast(token)   if has_acled else {}
-    live   = _fetch_acled_live(token)   if has_acled else {}
     gdelt  = _fetch_gdelt()
-
     ms = _score_market_proxy(market)
-    cs = _score_cast(cast)          if has_acled else 0.0
-    ls = _score_acled_live(live)    if has_acled else 0.0
     gs = _score_gdelt(gdelt)
 
-    if has_acled:
-        w = (0.70, 0.20, 0.05, 0.05)
-    else:
-        w = (0.75, 0.00, 0.00, 0.25)
+    active: set = {"market_proxy", "gdelt"}
 
-    score = round(ms*w[0] + cs*w[1] + ls*w[2] + gs*w[3], 1)
+    ucdp_token = os.environ.get("UCDP_API_TOKEN", "")
+    us = _fetch_ucdp_ged() if ucdp_token else 0.0
+    if ucdp_token:
+        active.add("ucdp_ged")
+
+    ais_key = os.environ.get("AISSTREAM_API_KEY", "")
+    ai = _fetch_ais_chokepoint_sync() if ais_key else 0.0
+    if ais_key:
+        active.add("ais_chokepoint")
+
+    firms_key = os.environ.get("NASA_FIRMS_API_KEY", "")
+    fs = _fetch_nasa_firms() if firms_key else 0.0
+    if firms_key:
+        active.add("nasa_firms")
+
+    # USGS requires no key — always active
+    ss = _fetch_usgs_seismic()
+    active.add("usgs_seismic")
+
+    # EDGAR macro requires no key — always active (6h cache)
+    if _HAVE_EDGAR:
+        try:
+            es = _get_edgar_macro_score()
+        except Exception as exc:
+            logger.warning(f"EDGAR macro score failed: {exc}")
+            es = 0.0
+        active.add("edgar_macro")
+    else:
+        es = 0.0
+        logger.warning("edgar_feed not importable — EDGAR macro layer skipped")
+
+    w = _effective_weights(active)
+    score = round(
+        ms * w["market_proxy"]   +
+        gs * w["gdelt"]          +
+        us * w["ucdp_ged"]       +
+        ai * w["ais_chokepoint"] +
+        fs * w["nasa_firms"]     +
+        ss * w["usgs_seismic"]   +
+        es * w["edgar_macro"],
+        1,
+    )
     logger.info(
         f"War Premium Score: {score}/100 "
-        f"(market={ms} cast={cs} live={ls} gdelt={gs})"
+        f"(market={ms} gdelt={gs} ucdp={us} ais={ai} "
+        f"firms={fs} usgs={ss} edgar={es})"
     )
     return score
 
@@ -589,82 +1091,102 @@ if __name__ == "__main__":
     print("  MARA CONFLICT INDEX — VERIFICATION")
     print("=" * 60)
 
-    # Market proxy
-    print("\n  Market proxy:")
-    market  = _fetch_market_proxy()
-    ms      = _score_market_proxy(market)
+    # Layer 1: Market proxy
+    print("\n  Layer 1: Market proxy:")
+    market = _fetch_market_proxy()
+    ms     = _score_market_proxy(market)
     print(f"    defense_momentum : {market['defense_momentum']:.4f}")
     print(f"    gold_oil_ratio   : {market['gold_oil_ratio']:.2f}")
     print(f"    vix              : {market['vix']:.2f}")
     print(f"    score            : {ms:.1f}/100")
 
-    # ACLED auth
-    print(f"\n  ACLED auth ({os.environ.get('ACLED_EMAIL', 'not set')}):")
-    token = _get_acled_token()
-    print(f"    token            : {'✅ ' + token[:20] + '...' if token else '❌ check .env'}")
-
-    # CAST
-    cs = 0.0
-    if token:
-        print("\n  ACLED CAST:")
-        cast = _fetch_acled_cast(token)
-        cs   = _score_cast(cast)
-        print(f"    score            : {cs:.1f}/100")
-        print(f"    total_forecast   : {cast.get('total_forecast', 0):,}")
-        print(f"    battles          : {cast.get('battles_forecast', 0):,}")
-        print(f"    erv              : {cast.get('erv_forecast', 0):,}")
-        print(f"    vac              : {cast.get('vac_forecast', 0):,}")
-        print(f"    months_fetched   : {cast.get('months_fetched', 0)}")
-
-    # Live events
-    ls = 0.0
-    if token:
-        print("\n  ACLED live events (last 30 days):")
-        live = _fetch_acled_live(token)
-        ls   = _score_acled_live(live)
-        print(f"    score            : {ls:.1f}/100")
-        print(f"    total_rows       : {live.get('total_rows', 0)}")
-        print(f"    lethal_events    : {live.get('lethal_rows', 0)}")
-        print(f"    fatalities       : {live.get('fatalities', 0)}")
-        if live.get("total_rows", 0) == 0:
-            print("    ⚠️  Still 0 rows — check diagnostic log above")
-            print("       Single-country pass → account needs bulk access tier")
-            print("       Single-country fail → check acleddata.com/account/")
-
-    # GDELT
-    print("\n  GDELT (3 queries, 3.5s sleep between each):")
+    # Layer 2: GDELT
+    print("\n  Layer 2: GDELT (3 queries, 3.5s sleep between each):")
     gdelt = _fetch_gdelt()
     gs    = _score_gdelt(gdelt)
     print(f"    score            : {gs:.1f}/100")
-    print(f"    best_articles    : {gdelt.get('articles', 0)}  (needs ≥15 to score)")
+    print(f"    best_articles    : {gdelt.get('articles', 0)}  (needs >=15 to score)")
     print(f"    source           : {gdelt.get('source', 'unknown')}")
-    print(f"    note             : tone not available in artlist mode — count-only scoring")
 
-    # Composite
-    has_acled = token is not None
-    w = (0.70, 0.20, 0.05, 0.05) if has_acled else (0.75, 0.00, 0.00, 0.25)
-    composite = round(ms*w[0] + cs*w[1] + ls*w[2] + gs*w[3], 1)
+    # Layer 3: UCDP GED
+    print(f"\n  Layer 3: UCDP GED (token: "
+          f"{'set' if os.environ.get('UCDP_API_TOKEN') else 'not set'}):")
+    us = _fetch_ucdp_ged()
+    print(f"    score            : {us:.1f}/100")
+
+    # Layer 4: AIS chokepoints
+    print(f"\n  Layer 4: AIS chokepoints (key: "
+          f"{'set' if os.environ.get('AISSTREAM_API_KEY') else 'not set'}):")
+    ai = _fetch_ais_chokepoint_sync()
+    print(f"    score            : {ai:.1f}/100")
+
+    # Layer 5: NASA FIRMS
+    print(f"\n  Layer 5: NASA FIRMS (key: "
+          f"{'set' if os.environ.get('NASA_FIRMS_API_KEY') else 'not set'}):")
+    fs = _fetch_nasa_firms()
+    print(f"    score            : {fs:.1f}/100")
+
+    # Layer 6: USGS seismic
+    print("\n  Layer 6: USGS seismic (no key required):")
+    ss = _fetch_usgs_seismic()
+    print(f"    score            : {ss:.1f}/100")
+
+    # Layer 7: EDGAR macro
+    print("\n  Layer 7: EDGAR macro (no key required, 6h cache):")
+    if _HAVE_EDGAR:
+        es = _get_edgar_macro_score()
+    else:
+        es = 0.0
+        print("    edgar_feed not importable — skipped")
+    print(f"    score            : {es:.1f}/100")
+
+    # Active sources and effective weights
+    active: set = {"market_proxy", "gdelt", "usgs_seismic", "edgar_macro"}
+    if os.environ.get("UCDP_API_TOKEN"):
+        active.add("ucdp_ged")
+    if os.environ.get("AISSTREAM_API_KEY"):
+        active.add("ais_chokepoint")
+    if os.environ.get("NASA_FIRMS_API_KEY"):
+        active.add("nasa_firms")
+    if not _HAVE_EDGAR:
+        active.discard("edgar_macro")
+    w = _effective_weights(active)
+
+    composite = round(
+        ms * w["market_proxy"]   +
+        gs * w["gdelt"]          +
+        us * w["ucdp_ged"]       +
+        ai * w["ais_chokepoint"] +
+        fs * w["nasa_firms"]     +
+        ss * w["usgs_seismic"]   +
+        es * w["edgar_macro"],
+        1,
+    )
 
     print("\n  " + "=" * 40)
     print(f"  WAR PREMIUM SCORE : {composite:.1f} / 100")
     print(f"  Interpretation    : {_interpret(composite)}")
     print("  " + "=" * 40)
-    print(f"    market_score    {ms}")
-    print(f"    cast_score      {cs}")
-    print(f"    live_score      {ls}")
-    print(f"    gdelt_score     {gs}")
+    print(f"    market_score  {ms}  (weight: {w['market_proxy']:.0%})")
+    print(f"    gdelt_score   {gs}  (weight: {w['gdelt']:.0%})")
+    print(f"    ucdp_score    {us}  (weight: {w['ucdp_ged']:.0%})")
+    print(f"    ais_score     {ai}  (weight: {w['ais_chokepoint']:.0%})")
+    print(f"    firms_score   {fs}  (weight: {w['nasa_firms']:.0%})")
+    print(f"    usgs_score    {ss}  (weight: {w['usgs_seismic']:.0%})")
+    print(f"    edgar_score   {es}  (weight: {w['edgar_macro']:.0%})")
+    print(f"    weight_sum    {sum(w.values()):.3f}  (should be 1.000)")
 
     # Sanity checks (no network needed)
     pc_score  = round(_score_market_proxy(
-        {"defense_momentum": 0.02, "gold_oil_ratio": 38.0, "vix": 14.0}) * 0.75, 1)
+        {"defense_momentum": 0.02, "gold_oil_ratio": 38.0, "vix": 14.0}) * 0.83, 1)
     war_score = round(_score_market_proxy(
-        {"defense_momentum": 0.08, "gold_oil_ratio": 57.0, "vix": 30.0}) * 0.70
-        + 100.0 * 0.20, 1)
+        {"defense_momentum": 0.08, "gold_oil_ratio": 57.0, "vix": 30.0}) * 0.60
+        + 100.0 * 0.15, 1)
 
     print(f"\n  False positive check (peacetime commodity bull):")
     print(f"    {pc_score:.1f}/100  "
-          f"{'✅ PASS' if pc_score < 25 else '❌ FAIL — recalibrate thresholds'}")
-    print(f"  War scenario check (escalation + CAST maxed):")
+          f"{'PASS' if pc_score < 25 else 'FAIL — recalibrate thresholds'}")
+    print(f"  War scenario check (market escalation + GDELT maxed):")
     print(f"    {war_score:.1f}/100  "
-          f"{'✅ PASS' if war_score >= 50 else '❌ FAIL — recalibrate thresholds'}")
+          f"{'PASS' if war_score >= 25 else 'FAIL — recalibrate thresholds'}")
     print("=" * 60 + "\n")

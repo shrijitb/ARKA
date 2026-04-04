@@ -15,19 +15,30 @@ What this does:
     Strategy selection is regime-aware: WAR_PREMIUM → momentum/defense,
     BEAR_RECESSION → short bias, BULL_CALM → balanced swing.
 
+    ADX routing (auto mode):
+        ADX >= 25 (trending) → swing_macd
+        ADX <= 20 (ranging)  → range_mean_revert
+        20 < ADX < 25        → no signal (ambiguous — wait for confirmation)
+
+    Override via env var or POST /strategy:
+        ACTIVE_STRATEGY=auto  (default — ADX-routed)
+        ACTIVE_STRATEGY=swing  (force swing_macd regardless of ADX)
+        ACTIVE_STRATEGY=range  (force range_mean_revert regardless of ADX)
+
 OKX is the only non-geo-blocked exchange for MARA's location.
 Symbol format: BTC-USDT-SWAP (OKX perpetual format).
 
-REST contract (full MARA standard + /allocate):
-    GET  /health     liveness
-    GET  /status     pnl, sharpe, allocated_usd, open_positions, active_strategy
-    GET  /metrics    Prometheus text
-    POST /regime     adapt active strategy to regime
-    POST /allocate   receive capital from hypervisor, resize positions
-    POST /signal     (optional) return current signal to hypervisor
-    POST /execute    execute a specific trade instruction
-    POST /pause      stop new entries (keep open positions)
-    POST /resume     resume
+REST contract (full MARA standard + /allocate + /strategy):
+    GET  /health      liveness + ADX state
+    GET  /status      pnl, sharpe, allocated_usd, open_positions, active_strategy
+    GET  /metrics     Prometheus text (includes ADX gauges)
+    POST /regime      adapt active strategy to regime
+    POST /allocate    receive capital from hypervisor, resize positions
+    POST /signal      ADX-routed signals from both strategies
+    POST /execute     execute a specific trade instruction
+    POST /pause       stop new entries (keep open positions)
+    POST /resume      resume
+    POST /strategy    override active strategy mode at runtime
 """
 
 from __future__ import annotations
@@ -40,6 +51,8 @@ import math
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+import pandas as pd
 import structlog
 from fastapi import FastAPI
 from fastapi.responses import Response
@@ -47,6 +60,92 @@ from fastapi.responses import Response
 logger = structlog.get_logger(__name__)
 
 WORKER_NAME = "nautilus"
+
+# ── Strategy mode ─────────────────────────────────────────────────────────────
+# "auto" = ADX-routed | "swing" = force swing_macd | "range" = force range
+ACTIVE_STRATEGY_MODE: str = os.getenv("ACTIVE_STRATEGY", "auto")
+
+# ── Strategy instances ────────────────────────────────────────────────────────
+try:
+    from strategies.range_mean_revert import RangeMeanRevertStrategy
+    _range_strategy = RangeMeanRevertStrategy(
+        bb_period         = int(os.getenv("RANGE_BB_PERIOD",         "20")),
+        bb_std            = float(os.getenv("RANGE_BB_STD",          "2.0")),
+        rsi_period        = int(os.getenv("RANGE_RSI_PERIOD",        "14")),
+        stop_loss_pct     = float(os.getenv("RANGE_STOP_LOSS_PCT",   "0.015")),
+        take_profit_ratio = float(os.getenv("RANGE_TAKE_PROFIT_RATIO", "1.5")),
+    )
+    _HAVE_RANGE = True
+except ImportError:
+    _range_strategy = None
+    _HAVE_RANGE = False
+
+try:
+    from indicators.adx import AdxCalculator
+    _adx_router = AdxCalculator(period=14)
+    _HAVE_ADX = True
+except ImportError:
+    _adx_router = None
+    _HAVE_ADX = False
+
+# ── Live ADX state (updated every /signal call) ───────────────────────────────
+_last_adx_value: float = 0.0
+_last_adx_state: str   = "unknown"
+_last_active_strategy: str = "swing_macd"
+_signals_suppressed_total: int = 0
+
+# ── OHLCV helper ─────────────────────────────────────────────────────────────
+
+def _fetch_ohlcv(symbol: str, timeframe: str = "4h", limit: int = 100) -> pd.DataFrame:
+    """
+    Fetch OHLCV bars and return as a pandas DataFrame.
+    Uses OKX via ccxt when USE_LIVE_OHLCV is truthy; otherwise generates
+    synthetic GBM bars deterministically seeded by symbol name.
+
+    ccxt symbol format: 'BTC/USDT' (unified) — NOT 'BTC-USDT-SWAP'.
+    """
+    use_live = os.getenv("USE_LIVE_OHLCV", "false").lower() in ("1", "true", "yes")
+
+    if use_live:
+        try:
+            import ccxt
+            exchange = ccxt.okx({"enableRateLimit": True})
+            raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+            return df[["open", "high", "low", "close", "volume"]].astype(float)
+        except Exception as exc:
+            logger.warning("fetch_ohlcv_failed", symbol=symbol, error=str(exc),
+                           fallback="synthetic")
+
+    # Synthetic GBM — deterministic per symbol × 4h window (matches swing_macd seed)
+    base_prices = {
+        "BTC/USDT": 65_000.0, "ETH/USDT": 3_500.0, "SOL/USDT": 150.0,
+        "BNB/USDT": 580.0,    "AVAX/USDT": 35.0,
+    }
+    base = base_prices.get(symbol, 100.0)
+    cache_ttl = 14_400   # 4 h — same as swing_macd
+    rng = np.random.RandomState(
+        (hash(symbol) + int(time.time() // cache_ttl)) % (2 ** 31)
+    )
+    drift = rng.choice([-0.0001, 0.0, 0.0001, 0.0002])
+    sigma = 0.008
+    shocks = rng.normal(drift, sigma, limit)
+    closes = [base]
+    for s in shocks:
+        closes.append(closes[-1] * (1 + s))
+    closes = closes[1:]
+
+    rows = []
+    for i, c in enumerate(closes):
+        bar_range = c * rng.uniform(0.005, 0.02)
+        high  = c + bar_range * rng.uniform(0.3, 0.7)
+        low   = c - bar_range * rng.uniform(0.3, 0.7)
+        open_ = closes[i - 1] if i > 0 else c
+        vol   = rng.uniform(1e6, 5e7)
+        rows.append({"open": open_, "high": high, "low": low, "close": c, "volume": vol})
+
+    return pd.DataFrame(rows)
+
 
 # ── Recession hedge pairs — inverse ETFs, signals only (IBKR not wired yet) ──
 # Mirrors config.py RECESSION_PAIRS / RECESSION_REGIMES.
@@ -259,13 +358,17 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/health")
 def health():
     return {
-        "status":        "ok" if state.is_healthy() else "degraded",
-        "worker":        WORKER_NAME,
-        "paused":        state.paused,
-        "regime":        state.current_regime,
-        "engine_ready":  state.engine_ready,
-        "engine_error":  state.engine_error,
-        "open_positions": state.open_positions,
+        "status":               "ok" if state.is_healthy() else "degraded",
+        "worker":               WORKER_NAME,
+        "paused":               state.paused,
+        "regime":               state.current_regime,
+        "engine_ready":         state.engine_ready,
+        "engine_error":         state.engine_error,
+        "open_positions":       state.open_positions,
+        "active_strategy":      _last_active_strategy,
+        "active_strategy_mode": ACTIVE_STRATEGY_MODE,
+        "adx_value":            round(_last_adx_value, 2),
+        "adx_state":            _last_adx_state,
     }
 
 
@@ -284,7 +387,7 @@ def status():
         "win_rate":         round(state.win_rate(), 3),
         "trade_count":      state.trade_count,
         "open_positions":   state.open_positions,
-        "active_strategy":  state.active_strategy,
+        "active_strategy":  _last_active_strategy,
         "engine_ready":     state.engine_ready,
         "uptime_s":         round(state.uptime(), 1),
     }
@@ -331,7 +434,12 @@ async def update_regime(body: dict):
 
 @app.post("/signal")
 async def signal(body: dict):
-    """Return current signals — called by Hypervisor for advisory/monitoring."""
+    """
+    Return current signals — ADX-routed between swing_macd and range_mean_revert.
+    Called by Hypervisor for advisory/monitoring.
+    """
+    global _last_adx_value, _last_adx_state, _last_active_strategy, _signals_suppressed_total, ACTIVE_STRATEGY_MODE
+
     if state.paused or state.bias == "flat":
         return []
 
@@ -354,19 +462,108 @@ async def signal(body: dict):
                 "rationale":          f"Inverse ETF recession hedge | regime={state.current_regime}",
             })
 
-    # Swing signals for OKX crypto perps
+    # ── ADX-routed strategy signals for OKX crypto perps ─────────────────────
     for pair, instrument in OKX_INSTRUMENTS.items():
-        signals.append({
-            "worker":             WORKER_NAME,
-            "symbol":             instrument,
-            "direction":          "long" if state.bias == "momentum_long" else "neutral",
-            "confidence":         0.6,
-            "suggested_size_pct": 0.4,
-            "regime_tags":        [state.current_regime],
-            "ttl_seconds":        3600,
-            "rationale":          f"MACD+Fractals | bias={state.bias} | regime={state.current_regime}",
-        })
+        try:
+            df = _fetch_ohlcv(pair, timeframe="4h", limit=100)
+        except Exception as exc:
+            logger.warning("signal_ohlcv_fetch_failed", symbol=pair, error=str(exc))
+            continue
+
+        # Calculate ADX for routing
+        adx_value = 0.0
+        adx_state = "unknown"
+        df_adx = df
+        if _HAVE_ADX and _adx_router is not None and len(df) >= 30:
+            try:
+                df_adx = _adx_router.calculate(df)
+                adx_value = float(df_adx["adx"].iloc[-1])
+                adx_state = _adx_router.classify(adx_value)
+            except Exception as exc:
+                logger.debug("adx_calc_failed", symbol=pair, error=str(exc))
+
+        _last_adx_value = adx_value
+        _last_adx_state = adx_state
+
+        # ── Route by mode ─────────────────────────────────────────────────────
+        mode = ACTIVE_STRATEGY_MODE
+        if mode == "swing":
+            active_strategy = "swing_macd"
+            sig_list = _build_swing_signal(pair, instrument)
+        elif mode == "range":
+            active_strategy = "range_mean_revert"
+            sig_list = _build_range_signals(df_adx, instrument, state)
+        else:  # auto
+            if adx_state == "trending":
+                active_strategy = "swing_macd"
+                sig_list = _build_swing_signal(pair, instrument)
+            elif adx_state == "ranging":
+                active_strategy = "range_mean_revert"
+                sig_list = _build_range_signals(df_adx, instrument, state)
+            else:   # ambiguous or unknown
+                active_strategy = "none"
+                sig_list = []
+                _signals_suppressed_total += 1
+                logger.debug(
+                    "signal_suppressed_ambiguous_adx",
+                    symbol=pair, adx=round(adx_value, 1), state=adx_state,
+                )
+
+        _last_active_strategy = active_strategy
+        state.active_strategy = active_strategy
+        signals.extend(sig_list)
+
     return signals
+
+
+def _build_swing_signal(pair: str, instrument: str) -> list:
+    """Build a standard swing_macd advisory signal dict."""
+    return [{
+        "worker":             WORKER_NAME,
+        "symbol":             instrument,
+        "direction":          "long" if state.bias == "momentum_long" else "neutral",
+        "confidence":         0.6,
+        "suggested_size_pct": 0.4,
+        "regime_tags":        [state.current_regime],
+        "ttl_seconds":        3600,
+        "strategy":           "swing_macd",
+        "adx_value":          _last_adx_value,
+        "adx_state":          _last_adx_state,
+        "rationale":          f"MACD+Fractals | bias={state.bias} | regime={state.current_regime} | adx={_last_adx_value:.1f}",
+    }]
+
+
+def _build_range_signals(df_adx: "pd.DataFrame", instrument: str, st) -> list:
+    """Build range_mean_revert signals if strategy is available."""
+    if not _HAVE_RANGE or _range_strategy is None:
+        return []
+    try:
+        raw = _range_strategy.generate_signals(
+            df_adx, instrument, st.allocated_usd, st.paper_trading
+        )
+        # Inject standard MARA signal envelope fields
+        for sig in raw:
+            sig.setdefault("worker",      WORKER_NAME)
+            sig.setdefault("direction",   "long" if sig.get("action") == "BUY" else "short")
+            sig.setdefault("confidence",  0.55)
+            sig.setdefault("regime_tags", [st.current_regime])
+            sig.setdefault("ttl_seconds", 3600)
+        return raw
+    except Exception as exc:
+        logger.warning("range_signal_failed", error=str(exc))
+        return []
+
+
+@app.post("/strategy")
+async def set_strategy(body: dict):
+    """Override active strategy mode at runtime — no restart needed."""
+    global ACTIVE_STRATEGY_MODE
+    mode = body.get("mode", ACTIVE_STRATEGY_MODE)
+    if mode not in ("auto", "swing", "range"):
+        return {"status": "error", "message": f"Invalid mode '{mode}'. Use: auto|swing|range"}
+    ACTIVE_STRATEGY_MODE = mode
+    logger.info("strategy_mode_changed", mode=mode)
+    return {"status": "ok", "mode": mode}
 
 
 @app.post("/execute")
@@ -394,13 +591,64 @@ def resume():
 
 @app.get("/metrics")
 def metrics():
-    active = 0 if state.paused else 1
-    content = (
-        f'mara_worker_active{{worker="nautilus"}} {active}\n'
-        f'mara_nautilus_pnl_usd {state.realised_pnl:.4f}\n'
-        f'mara_nautilus_open_positions {state.open_positions}\n'
-        f'mara_nautilus_trade_count {state.trade_count}\n'
-        f'mara_nautilus_sharpe {state.sharpe():.4f}\n'
-        f'mara_nautilus_win_rate {state.win_rate():.4f}\n'
-    )
+    active     = 0 if state.paused else 1
+    paused_int = 1 if state.paused else 0
+    total_pnl  = round(state.realised_pnl + state.unrealised_pnl, 4)
+
+    # ADX + strategy routing metrics
+    all_strategies = ("swing_macd", "range_mean_revert", "none")
+    strategy_lines = [
+        f'mara_nautilus_active_strategy{{strategy="{s}"}} '
+        f'{"1" if s == _last_active_strategy else "0"}'
+        for s in all_strategies
+    ]
+
+    lines = [
+        # ── Standard labeled gauges (required by hypervisor / Grafana) ──────
+        f'mara_worker_pnl_usd{{worker="nautilus"}} {total_pnl}',
+        f'mara_worker_allocated_usd{{worker="nautilus"}} {state.allocated_usd:.2f}',
+        f'mara_worker_sharpe{{worker="nautilus"}} {state.sharpe():.4f}',
+        f'mara_worker_open_positions{{worker="nautilus"}} {state.open_positions}',
+        f'mara_worker_paused{{worker="nautilus"}} {paused_int}',
+        # ── Legacy (keep for backward compat) ───────────────────────────────
+        f'mara_worker_active{{worker="nautilus"}} {active}',
+        f'mara_nautilus_pnl_usd {state.realised_pnl:.4f}',
+        f'mara_nautilus_open_positions {state.open_positions}',
+        f'mara_nautilus_trade_count {state.trade_count}',
+        f'mara_nautilus_sharpe {state.sharpe():.4f}',
+        f'mara_nautilus_win_rate {state.win_rate():.4f}',
+        # ── ADX and strategy routing ─────────────────────────────────────────
+        f'mara_nautilus_signals_suppressed_total {_signals_suppressed_total}',
+    ] + strategy_lines
+
+    # ── Per-position detail ──────────────────────────────────────────────────
+    now = time.time()
+    for pair, pos in state._positions.items():
+        sym       = pair.replace('"', "").replace("\\", "")
+        side_int  = 1 if pos["side"] == "long" else -1
+        age_cyc   = (now - pos.get("opened_at", now)) / 60.0
+        lines += [
+            f'mara_position_size_usd{{worker="nautilus",symbol="{sym}"}} {pos["size_usd"]:.2f}',
+            f'mara_position_side{{worker="nautilus",symbol="{sym}"}} {side_int}',
+            f'mara_position_entry_price{{worker="nautilus",symbol="{sym}"}} {pos["entry"]:.4f}',
+            # Unrealized PnL requires live price — unavailable at metrics time in paper mode
+            f'mara_position_unrealized_pnl_usd{{worker="nautilus",symbol="{sym}"}} 0.0',
+            f'mara_position_age_cycles{{worker="nautilus",symbol="{sym}"}} {age_cyc:.1f}',
+            # Execution quality — paper mode: perfect fills, zero slippage
+            f'mara_observed_slippage_bps{{worker="nautilus",symbol="{sym}",paper_mode="true"}} 0',
+            f'mara_fill_rate_observed{{worker="nautilus",symbol="{sym}",paper_mode="true"}} 1.0',
+        ]
+
+    # ── Per-pair ADX gauge ────────────────────────────────────────────────────
+    # Reports the last computed ADX value keyed to the first pair only (the
+    # routing loop updates the global each time, so this reflects the last pair
+    # processed).  Grafana can use this for trending/ranging dashboards.
+    for pair in OKX_INSTRUMENTS:
+        sym = pair.replace('"', "").replace("\\", "")
+        lines.append(
+            f'mara_nautilus_adx_value{{symbol="{sym}"}} {_last_adx_value:.2f}'
+        )
+        break   # one representative gauge per cycle (last-processed pair)
+
+    content = "\n".join(lines) + "\n"
     return Response(content=content, media_type="text/plain")

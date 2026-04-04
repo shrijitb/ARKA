@@ -2,7 +2,7 @@
 
 An open-source, autonomous trading system for turbulent macro environments. MARA coordinates specialized AI agents across crypto, futures, commodities, and prediction markets using dynamic regime-aware capital allocation.
 
-**Status**: Paper trading active (March 2026) | WAR_PREMIUM regime, 80% confidence | **License**: LGPL-3.0
+**Status**: Paper trading active (April 2026) | WAR_PREMIUM regime, 80% confidence | **License**: LGPL-3.0
 
 ---
 
@@ -56,9 +56,9 @@ MARA targets **futures, crypto, forex, ETFs, and prediction markets** in regime-
 
 A **FastAPI Hypervisor** orchestrates five specialized worker agents:
 
-- **Nautilus**: MACD + Fractals swing trading on OKX perps
+- **Nautilus**: ADX-routed strategy engine — MACD+Fractals for trending markets, mean-reversion for ranging markets, silence for ambiguous ADX
 - **Polymarket**: CLOB market-making on prediction markets (stub until Phase 3)
-- **AutoHedge**: LLM-based advisory (phi3:mini via Ollama)
+- **Analyst**: Regime-aware market thesis via Ollama phi3:mini (advisory-only, no capital execution)
 - **Arbitrader**: Cross-exchange spread arbitrage (Java + Python sidecar)
 - **Core Dividends**: Passive SCHD + VYM ETF buy-and-hold sleeve
 
@@ -97,10 +97,16 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
      ┌─────────────────────┼──────────────────────────┐
      ▼                     ▼                          ▼
 ┌──────────┐  ┌─────────────┐  ┌──────────┐  ┌────────────────┐
-│arbitrader│  │  nautilus   │  │autohedge │  │ core_dividends │
+│arbitrader│  │  nautilus   │  │ analyst  │  │ core_dividends │
 │ port 8004│  │  port 8001  │  │ port 8003│  │   port 8006    │
-│ arb sim  │  │ MACD+Frac.  │  │phi3:mini │  │  SCHD+VYM hold │
+│ arb sim  │  │ ADX-routed  │  │phi3:mini │  │  SCHD+VYM hold │
 └──────────┘  └─────────────┘  └──────────┘  └────────────────┘
+                   │
+           ┌───────┴────────┐
+           │  ADX < 20      │  ADX > 25
+           ▼                ▼
+    range_mean_revert   swing_macd
+    (BB+RSI+Fractal)    (MACD+Fractal)
 
 ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐
 │ telegram-bot │  │    ollama    │  │   polymarket    │
@@ -114,9 +120,9 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
 | Container | Key | Port | Tech | Mode |
 |-----------|-----|------|------|------|
 | mara-hypervisor | — | 8000 | FastAPI | Orchestrator |
-| mara-nautilus | `nautilus` | 8001 | NautilusTrader | Paper sim (MACD + Fractals) |
+| mara-nautilus | `nautilus` | 8001 | NautilusTrader | Paper sim — ADX-routed dual strategy |
 | mara-polymarket | `polymarket` | 8002 | Python CLOB | Stub — needs `POLY_PRIVATE_KEY` |
-| mara-autohedge | `autohedge` | 8003 | litellm + Ollama | phi3:mini advisory |
+| mara-analyst | `analyst` | 8003 | FastAPI + Ollama | phi3:mini thesis (advisory-only) |
 | mara-arbitrader | `arbitrader` | 8004 | Java + Python sidecar | Paper arb sim |
 | mara-core-dividends | `core_dividends` | 8006 | FastAPI | Paper hold (SCHD + VYM) |
 | mara-ollama | — | 11434 | Ollama | phi3:mini CPU inference |
@@ -129,8 +135,8 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
 
 The classifier outputs one of 7 regime labels. Capital is split across workers per profile, with a cash buffer enforced at all times. Weights normalise against the sum of all non-zero profile entries — not just healthy workers — so a single worker starting up cannot absorb more than its intended share.
 
-| Regime | arbitrader | nautilus | polymarket | autohedge | core_dividends | Max deploy |
-|--------|-----------|---------|-----------|----------|----------------|-----------|
+| Regime | arbitrader | nautilus | polymarket | analyst | core_dividends | Max deploy |
+|--------|-----------|---------|-----------|---------|----------------|-----------|
 | `WAR_PREMIUM` | 36% | 20% | 24% | 0% | 20% | 70% |
 | `CRISIS_ACUTE` | 40% | 10% | 20% | 0% | 0% | 50% |
 | `BEAR_RECESSION` | 20% | 36% | 16% | 8% | 20% | 75% |
@@ -138,6 +144,8 @@ The classifier outputs one of 7 regime labels. Capital is split across workers p
 | `REGIME_CHANGE` | 32% | 24% | 16% | 8% | 20% | 70% |
 | `SHADOW_DRIFT` | 32% | 28% | 12% | 8% | 20% | 75% |
 | `BULL_CALM` | 24% | 36% | 8% | 12% | 20% | 80% |
+
+The `analyst` worker receives 0% allocation in WAR_PREMIUM and CRISIS_ACUTE — it is advisory-only and never executes trades, but its capital slot is still passed to keep the allocator profile sum consistent.
 
 Priority order (first match wins): `WAR_PREMIUM > CRISIS_ACUTE > BEAR_RECESSION > BULL_FROTHY > REGIME_CHANGE > SHADOW_DRIFT > BULL_CALM`
 
@@ -149,22 +157,28 @@ Sharpe penalty: if a worker's rolling Sharpe < 0.5, its allocation is halved. Fr
 
 ## Conflict Index
 
-A 0–100 war premium score that is the primary input to `WAR_PREMIUM` classification:
+A 0–100 war premium score that feeds the `WAR_PREMIUM` regime classifier. Six independent data layers with dynamic weight redistribution — if an API key is absent, its weight is absorbed by the market proxy, so the total always sums to 100%.
 
-| Source | Weight | Status |
-|--------|--------|--------|
-| Market proxy (defense ETF momentum + gold/oil ratio + VIX) | 70–75% | Working |
-| ACLED CAST lethal event forecasts | 20% | 403 on free tier — permanently unavailable |
-| ACLED live conflict events | 5% | 403 on free tier — permanently unavailable |
-| GDELT conflict queries | 5–25% | Working (rate-limited) |
+| Layer | Source | Base weight | Auth |
+|-------|--------|-------------|------|
+| 1 | Market proxy (defense ETF + gold/oil ratio + VIX) | 60% | None |
+| 2 | GDELT conflict queries (Goldstein score) | 15% | None |
+| 3 | UCDP GED georeferenced conflict events | 10% | `UCDP_API_TOKEN` |
+| 4 | AIS chokepoint vessel traffic (Hormuz, Suez, Malacca, Taiwan, Bab-el-Mandeb) | 10% | `AISSTREAM_API_KEY` |
+| 5 | NASA FIRMS VIIRS thermal anomalies | 3% | `NASA_FIRMS_API_KEY` |
+| 6 | USGS M4.5+ earthquakes near critical infrastructure | 2% | None |
 
-`WAR_PREMIUM` fires when `war_premium_score > 25`. Score currently runs on market proxy + GDELT only.
+`WAR_PREMIUM` fires when `war_premium_score > 25`. Without optional keys, the score falls back to market proxy (83%) + GDELT (15%) + USGS (2%).
+
+**ACLED status:** OAuth token is acquired successfully but `/api/cast/read` and `/api/acled/read` return HTTP 403 on the free tier — requires an approved researcher account. Permanently removed from active scoring; code preserved for future use.
+
+**Optional Ollama enrichment:** `parse_osint_with_llm()` calls phi3:mini to extract affected commodities and escalation likelihood from UCDP event text. Advisory-only — never in the scoring hot path.
 
 **Data source decisions:**
-- **DXY proxy**: `UUP` ETF (Invesco DB US Dollar Index Bullish Fund) — `DX=F` and `DX-Y.NYB` return empty frames intermittently via yfinance
+- **DXY proxy**: `UUP` ETF — `DX=F` and `DX-Y.NYB` return empty frames intermittently
 - **BDI proxy**: `BDRY` ETF — `^BDI` delisted from yfinance
-- **Gold/oil ratio threshold**: 45.0 — gold near $5,000 puts the ratio at ~57 baseline; old threshold of 20 false-triggered WAR_PREMIUM in peacetime commodity bull markets
-- **Market proxy at 70–75%**: ensures no single geopolitical data source can unilaterally trigger a regime change
+- **Gold/oil ratio threshold**: 45.0 — gold near $5,000 puts the ratio at ~57; old threshold of 20 false-triggered WAR_PREMIUM
+- **Market proxy primary (60%+)**: no single geopolitical source can unilaterally trigger a regime change
 
 ---
 
@@ -330,7 +344,7 @@ USE_LIVE_OHLCV=false
 INITIAL_CAPITAL_USD=200.0
 EXCHANGES=["okx"]
 
-# Ollama (local LLM for AutoHedge)
+# Ollama (local LLM — used by analyst worker and OSINT enrichment)
 OLLAMA_HOST=http://ollama:11434
 OLLAMA_MODEL=phi3:mini
 
@@ -338,6 +352,19 @@ OLLAMA_MODEL=phi3:mini
 FRED_API_KEY=                         # optional — yfinance fallback works without it
 ACLED_EMAIL=
 ACLED_PASSWORD=                       # free tier: token works, data endpoints 403
+
+# Conflict index — optional enrichment sources
+UCDP_API_TOKEN=                       # free — email ucdp.uu.se to request
+AISSTREAM_API_KEY=                    # free — register at aisstream.io
+NASA_FIRMS_API_KEY=                   # free — register at firms.modaps.eosdis.nasa.gov
+
+# Nautilus strategy router
+ACTIVE_STRATEGY=auto                  # auto (ADX-routed) | swing | range
+RANGE_BB_PERIOD=20
+RANGE_BB_STD=2.0
+RANGE_RSI_PERIOD=14
+RANGE_STOP_LOSS_PCT=0.015
+RANGE_TAKE_PROFIT_RATIO=1.5
 
 # OKX (only active exchange)
 OKX_API_KEY=                          # Phase 3 only — leave empty for paper trading
@@ -403,10 +430,15 @@ docker compose down
 curl -s http://localhost:8000/status | python3 -m json.tool
 curl -s http://localhost:8000/regime
 curl -s http://localhost:8000/watchlist
-curl -s http://localhost:8001/health   # nautilus
-curl -s http://localhost:8003/health   # autohedge
-curl -s http://localhost:8004/metrics  # arbitrader prometheus
-curl -s http://localhost:8006/health   # core_dividends
+curl -s http://localhost:8000/thesis              # latest analyst thesis
+curl -s http://localhost:8001/health              # nautilus (includes adx_value, adx_state)
+curl -s http://localhost:8003/health              # analyst
+curl -s http://localhost:8004/metrics             # arbitrader prometheus
+curl -s http://localhost:8006/health              # core_dividends
+
+# Override nautilus strategy at runtime (no restart needed)
+curl -s -X POST http://localhost:8001/strategy -H "Content-Type: application/json" \
+     -d '{"mode": "swing"}'                       # auto | swing | range
 ```
 
 ---
@@ -442,24 +474,29 @@ curl -s http://localhost:8000/status | python3 -m json.tool
 
 ```bash
 ~/mara/.venv/bin/python -m pytest tests/ -v
-# Expected: 86 passed, 19 skipped, 0 failed
+# Expected: 124 passed, 8 skipped, 0 failed
 ```
 
 ### Test breakdown
 
-| Class | What it tests | Status |
-|-------|--------------|--------|
+| Class | What it tests | Count |
+|-------|--------------|-------|
 | `TestWorkerContract` | nautilus + arbitrader REST contract endpoints | Pass |
 | `TestCapitalAllocator` | dollar splits, Sharpe penalty, cold-start single-worker cap regression | Pass |
-| `TestRiskManagerIntegration` | all 7 risk limits, cooldown, re-allocation peak-reset regression | 10/10 pass |
-| `TestHypervisorCycle` | registry keys, capital math, classifier shape | 4/4 pass |
-| `TestEndToEndSignalSchema` | signal format, `advisory_only` enforcement | 4/6 pass, 2 skip |
-| `TestAcledIntegration` | token acquisition, CAST, live events | 1 pass, 2 skip (free tier) |
-| `TestGdeltIntegration` | GDELT query, conflict scoring | 3/3 pass |
+| `TestRiskManagerIntegration` | all 7 risk limits, cooldown, re-allocation peak-reset regression | 10/10 |
+| `TestHypervisorCycle` | registry keys, capital math, classifier shape | 4/4 |
+| `TestEndToEndSignalSchema` | signal format, `advisory_only` enforcement | 4/6, 2 skip |
+| `TestAcledIntegration` | token acquisition, CAST, live events | 1/3, 2 skip |
+| `TestGdeltIntegration` | GDELT query, conflict scoring | 3/3 |
+| `TestConflictIndexNewSources` | UCDP/AIS/FIRMS graceful skip, weight redistribution, LLM fallback | 5/5 |
+| `TestAnalystWorker` | signal schema, advisory-only, thesis cache, Ollama timeout | 5/5 |
+| `TestAdxCalculator` | classify trending/ranging/ambiguous, column output, value range | 5/5 |
+| `TestRangeMeanRevertStrategy` | dead-market filter, insufficient bars, signal structure | 4/4 |
+| `TestStrategyRouter` | forced swing mode, auto default, `/strategy` runtime change | 3/3 |
 
 ### Expected skips
 
-- `autohedge` and `polymarket` contract tests — `litellm` / `py_clob_client` not in venv (pass in Docker)
+- `polymarket` contract tests — `py_clob_client` not in venv (passes in Docker)
 - ACLED CAST + live events — free tier 403 is permanent, not a bug
 
 ---
@@ -536,11 +573,12 @@ The `RiskManager` enforces these limits every cycle. A breach triggers a 1-hour 
 | F-02 | Passive dividend sleeve (`core_dividends`) | Done | SCHD + VYM paper hold, port 8006 |
 | F-03 | Inverse ETF recession signals (SH, PSQ) | Done | Advisory-only until IBKR wired (Phase 3) |
 | F-04 | Quarterly profit sweep skeleton | Done | APScheduler cron Jan/Apr/Jul/Oct 7th @ 09:00 |
-| F-05 | AutoHedge binary sanity check | Waiting | Implement after 1–2 weeks phi3:mini observation |
-| F-06 | Polymarket far-book live test | Blocked | Requires `POLY_PRIVATE_KEY` |
-| F-07 | AutoHedge sentiment multiplier (1.1×/0.5×) | Parked | High complexity; wait for F-05 stable |
-| F-08 | AutoHedge + GDELT dynamic watchlist | Parked | High complexity |
-| F-09 | NautilusTrader full backtest harness | Parked | After 4+ weeks paper trading data |
+| F-05 | Analyst worker (AutoHedge replacement) | Done | Direct Ollama HTTP, 5-min thesis cache, `GET /thesis` |
+| F-06 | Conflict index expansion (UCDP/AIS/FIRMS/USGS) | Done | 6-source scoring, dynamic weight redistribution |
+| F-07 | Nautilus ADX strategy router | Done | ADX gate + `range_mean_revert` strategy, `/strategy` toggle |
+| F-08 | Vectorized strategy backtest scaffold | Done | `backtest/strategy_comparison.py`, OKX parquet cache |
+| F-09 | Polymarket far-book live test | Blocked | Requires `POLY_PRIVATE_KEY` |
+| F-10 | NautilusTrader full backtest harness | Parked | After 4+ weeks paper trading data |
 
 ---
 
@@ -556,6 +594,9 @@ The `RiskManager` enforces these limits every cycle. A breach triggers a 1-hour 
 | **No `platform:` flags** | Adding platform constraints causes `exec format error` for pre-built native binaries (e.g. `ollama/ollama`) under QEMU |
 | **`ollama/ollama` has no curl** | Healthcheck uses `["CMD", "ollama", "list"]` — not curl |
 | **`python:3.11-slim` has no curl** | Polymarket healthcheck uses `python3 -c "import urllib.request; ..."` |
+| **ADX ambiguous = silence** | ADX 20–25 returns no signals in auto mode — this is intentional, not a bug. Use `POST /strategy {"mode":"swing"}` to override. |
+| **Analyst worker is advisory-only** | `analyst` never calls `/execute`. Its allocation weight in WAR_PREMIUM/CRISIS_ACUTE is 0% by design. |
+| **Conflict index optional keys** | UCDP/AIS/FIRMS keys are optional. Missing keys redistribute weight to market_proxy; total always sums to 100%. |
 
 ---
 
@@ -612,11 +653,18 @@ Sharpe penalty halves allocation if rolling Sharpe < 0.5. Fresh workers start wi
 
 ### Conflict Index Sources
 
-- **ACLED CAST**: 21-day lethal conflict forecasts — 403 on free tier (permanent)
-- **ACLED live events**: Recent conflict events by country — 403 on free tier (permanent)
-- **GDELT**: Global news conflict sentiment (Goldstein score) — working, rate-limited
+| Source | Weight | Cache | Notes |
+|--------|--------|-------|-------|
+| Market proxy (defense ETF, gold/oil, VIX) | 60%+ | Live | Always active; absorbs weight of absent sources |
+| GDELT conflict sentiment | 15% | Live | No auth — rate-limited |
+| UCDP GED conflict events | 10% | 4 h | Requires `UCDP_API_TOKEN` |
+| AIS chokepoint vessel traffic | 10% | 15 min | Requires `AISSTREAM_API_KEY`; WebSocket, 8 s collection |
+| NASA FIRMS thermal anomalies | 3% | 3 h | Requires `NASA_FIRMS_API_KEY`; VIIRS NRT CSV |
+| USGS seismic (M4.5+ near infrastructure) | 2% | 1 h | No auth required |
 
-Score composition (without ACLED): 75% market proxy + 25% GDELT
+Without any optional keys: market proxy = 83%, GDELT = 15%, USGS = 2%.
+
+- **ACLED CAST / live events**: Removed from scoring — free tier returns HTTP 403 permanently
 
 ---
 
@@ -665,7 +713,7 @@ Use Docker DNS names, overridable via env vars. Never hardcode `localhost` or IP
 ```
 NAUTILUS_URL        http://worker-nautilus:8001
 POLYMARKET_URL      http://worker-polymarket:8002
-AUTOHEDGE_URL       http://worker-autohedge:8003
+ANALYST_URL         http://worker-analyst:8003
 ARBITRADER_URL      http://worker-arbitrader:8004
 CORE_DIVIDENDS_URL  http://worker-core-dividends:8006
 HYPERVISOR_URL      http://hypervisor:8000
@@ -674,13 +722,16 @@ HYPERVISOR_URL      http://hypervisor:8000
 ### Key design decisions
 
 - **OKX only** — Binance HTTP 451, Bybit HTTP 403. Symbol format: `BTC-USDT-SWAP`
-- **Market proxy primary (70–75%)** — prevents commodity bull markets from false-triggering WAR_PREMIUM
+- **Market proxy primary (60–83%)** — prevents commodity bull markets from false-triggering WAR_PREMIUM; absorbs weight of absent conflict sources
 - **2-of-N signal requirement per regime** — prevents single-indicator false positives
 - **Workers are FastAPI processes** — not Python class hierarchies; pluggable and replaceable
 - **`asyncio.gather` for health checks** — sequential awaits in a dict comprehension caused httpx shared-client state failures
 - **`worker_sharpe` stores `None` for fresh workers** — `0.0` would trigger the Sharpe gate every cycle
 - **Ollama healthcheck uses `ollama list`** — `ollama/ollama` image has no curl/wget
-- **Telegram bot sends direct via Bot API** — hypervisor uses `requests.post` to `api.telegram.org` for notifications; no inter-container dependency on the bot container
+- **Telegram bot sends direct via Bot API** — hypervisor uses `requests.post` to `api.telegram.org`; no inter-container dependency on the bot container
+- **ADX ambiguous zone returns `[]`** — ADX 20–25 is indeterminate; no signals until the market commits to a direction. Override with `POST /strategy {"mode":"swing"}`.
+- **Analyst is advisory-only** — `/execute` always returns `advisory_only=true`; it never moves capital
+- **Conflict index weight redistribution** — absent API keys add their weight to market_proxy; total always sums to 1.0 so the score stays calibrated
 
 ---
 
@@ -705,7 +756,6 @@ MARA uses **NautilusTrader** (also LGPL-3.0), which requires the same license. T
 |---------|---------|
 | [NautilusTrader](https://github.com/nautechsystems/nautilus_trader) | LGPL-3.0 |
 | [StockSharp](https://github.com/StockSharp/StockSharp) | Apache 2.0 |
-| [AutoHedge](https://github.com/The-Swarm-Corporation/AutoHedge) | MIT |
 
 All licenses compatible with LGPL-3.0.
 
@@ -748,23 +798,62 @@ mara/
 │   └── risk/manager.py                  # Risk enforcement
 ├── workers/
 │   ├── nautilus/
-│   │   ├── worker_api.py                # FastAPI port 8001, paper sim
-│   │   └── strategies/swing_macd.py     # MACD + Bullish Fractal strategy
+│   │   ├── worker_api.py                # FastAPI port 8001, ADX-routed strategy engine
+│   │   ├── indicators/adx.py            # Pure Python ADX (Wilder's smoothing)
+│   │   └── strategies/
+│   │       ├── swing_macd.py            # MACD + Fractals (trending, ADX >= 25)
+│   │       └── range_mean_revert.py     # BB + RSI + Fractal S/R (ranging, ADX <= 20)
 │   ├── polymarket/adapter/main.py       # FastAPI port 8002, CLOB stub
-│   ├── autohedge/worker_api.py          # FastAPI port 8003, phi3:mini advisory
+│   ├── analyst/worker_api.py            # FastAPI port 8003, phi3:mini thesis (advisory-only)
 │   ├── arbitrader/sidecar/main.py       # FastAPI port 8004, JVM lifecycle
 │   ├── core_dividends/worker_api.py     # FastAPI port 8006, SCHD+VYM hold
 │   ├── telegram_bot/main.py             # Polling bot, no port
 │   └── stocksharp/                      # Phase 3 only — .NET 8 IBKR router
 ├── data/feeds/
 │   ├── market_data.py                   # yfinance, FRED wrappers; UUP/BDRY proxies
-│   └── conflict_index.py                # ACLED + GDELT + market proxy fusion
+│   └── conflict_index.py                # 6-source conflict index; dynamic weight redistribution
+├── backtest/
+│   ├── strategy_comparison.py           # Vectorized pandas backtest (swing vs range)
+│   └── run_swing_macd.py                # Legacy single-strategy runner
 ├── tests/
-│   ├── test_mara.py                     # Unit + integration tests
-│   └── test_integration_dryrun.py       # Dry-run integration suite (86 pass, 19 skip)
+│   ├── test_mara.py                     # 124 unit + integration tests
+│   └── test_integration_dryrun.py       # Dry-run integration suite
 └── scripts/
     └── deploy_pi.sh                     # Raspberry Pi deployment script
 ```
+
+---
+
+## CI/CD
+
+GitHub Actions pipelines live in [.github/workflows/](.github/workflows/).
+
+| Workflow | Trigger | Jobs |
+|----------|---------|------|
+| `ci.yml` | Push to any branch, PR to main | test → build (main only) → deploy-vps (main) → deploy-pi (tags only) |
+| `pr-check.yml` | PR to main | lint (ruff) + test |
+
+### Required GitHub Actions Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `DOCKER_USERNAME` | Docker Hub username |
+| `DOCKER_PASSWORD` | Docker Hub password / access token |
+| `VPS_HOST` | VPS hostname or IP |
+| `VPS_USER` | VPS SSH username |
+| `VPS_SSH_KEY` | VPS private SSH key (PEM) |
+| `PI_HOST` | Raspberry Pi hostname or IP |
+| `PI_USER` | Pi SSH username |
+| `PI_SSH_KEY` | Pi private SSH key (PEM) |
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather (same as `.env`) |
+| `TELEGRAM_ALLOWED_USER_ID` | Your Telegram numeric user ID (same as `.env`) |
+
+### Deployment targets
+
+- **VPS (x86)** — auto-deploys on every push to `main` after images are built.
+- **Raspberry Pi (ARM64)** — deploys only on `v*.*.*` tags (manual release). Uses `docker-compose.pi.yml` override (slower cycle interval, single Ollama model).
+
+Multi-arch images (`linux/amd64,linux/arm64`) are pushed to Docker Hub in the build job; `docker compose pull` on each host fetches the native arch automatically. No `platform:` flags are added to `docker-compose.yml`.
 
 ---
 
@@ -774,4 +863,4 @@ MARA is a research and development system. Past performance does not guarantee f
 
 ---
 
-**MARA v1.0 | March 2026 | LGPL-3.0**
+**MARA v1.1 | April 2026 | LGPL-3.0**

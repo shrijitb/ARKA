@@ -121,7 +121,7 @@ def _make_client(worker_name: str, rel_path: str):
 WORKER_PATHS = {
     "nautilus":   "workers/nautilus/worker_api.py",
     "arbitrader": "workers/arbitrader/sidecar/main.py",
-    "autohedge":  "workers/autohedge/worker_api.py",
+    "analyst":    "workers/analyst/worker_api.py",
     "polymarket": "workers/polymarket/adapter/main.py",
 }
 
@@ -334,7 +334,7 @@ class TestCapitalAllocator:
         result = allocator.compute(
             regime="BULL_CALM",
             worker_health={"nautilus": False, "arbitrader": True,
-                           "polymarket": True,  "autohedge":  True},
+                           "polymarket": True,  "analyst":  True},
         )
         alloc = result.allocations.get("nautilus", "KEY_ABSENT")
         assert "nautilus" not in result.allocations, (
@@ -377,17 +377,17 @@ class TestCapitalAllocator:
             worker_health={
                 "nautilus": False, "polymarket": False,
                 "arbitrader": False, "core_dividends": False,
-                "autohedge": True,
+                "analyst": True,
             },
         )
-        alloc = result.allocations.get("autohedge", 0)
+        alloc = result.allocations.get("analyst", 0)
         assert alloc <= 100.0, (
-            f"Single healthy worker (autohedge) received ${alloc:.2f} "
+            f"Single healthy worker (analyst) received ${alloc:.2f} "
             f"which exceeds 50% ($100) of $200 capital.\n"
             f"  full allocations: {result.allocations}\n"
             f"  FIX: normalise against profile_nonzero_sum, not eligible sum"
         )
-        print(f"\n  Single-worker startup: autohedge=${alloc:.2f} (limit=$100.00)")
+        print(f"\n  Single-worker startup: analyst=${alloc:.2f} (limit=$100.00)")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -517,14 +517,14 @@ class TestRiskManagerIntegration:
         """Regression: when more workers join mid-run, hypervisor re-allocates each
         worker with a lower amount.  record_worker_allocation() must reset the peak
         so the reduction doesn't appear as a drawdown and halt the system."""
-        # Cycle 1: only autohedge healthy, gets $60
-        rm.record_worker_allocation("autohedge", 60.0)
-        # Cycle 2: all workers join, autohedge scaled down to $19.2
-        rm.record_worker_allocation("autohedge", 19.2)
+        # Cycle 1: only analyst healthy, gets $60
+        rm.record_worker_allocation("analyst", 60.0)
+        # Cycle 2: all workers join, analyst scaled down to $19.2
+        rm.record_worker_allocation("analyst", 19.2)
         verdict = rm.assess(
             total_capital=200.0, free_capital=40.0, open_positions=0,
-            worker_pnl={"autohedge": 0.0},
-            worker_allocated={"autohedge": 19.2},
+            worker_pnl={"analyst": 0.0},
+            worker_allocated={"analyst": 19.2},
         )
         assert verdict.safe, (
             f"Re-allocation from $60→$19.2 (more workers joining) should NOT "
@@ -610,7 +610,7 @@ class TestHypervisorCycle:
             "nautilus":   {"open_positions": 2},
             "arbitrader": {"open_positions": 1},
             "polymarket": {"open_positions": 0},
-            "autohedge":  {},    # Missing key — must default to 0, not KeyError
+            "analyst":    {},    # Missing key — must default to 0, not KeyError
         }
         count = hyp._count_open_positions()
         assert count == 3, (
@@ -619,6 +619,7 @@ class TestHypervisorCycle:
         )
         print(f"\n  Open positions: {count} (expected 3)")
 
+    @pytest.mark.integration
     def test_classifier_returns_valid_regime_result(self, hyp):
         clf = hyp.classifier
         if not hasattr(clf, "classify_sync"):
@@ -659,7 +660,7 @@ class TestHypervisorCycle:
 SIGNAL_WORKER_PATHS = {
     "nautilus":   "workers/nautilus/worker_api.py",
     "arbitrader": "workers/arbitrader/sidecar/main.py",
-    "autohedge":  "workers/autohedge/worker_api.py",
+    # analyst excluded — advisory-only with different signal schema (tested in TestAnalystWorker)
 }
 
 
@@ -685,7 +686,7 @@ class TestEndToEndSignalSchema:
     Not a list               → /signal must return a JSON array (even if empty)
     Missing signal field     → add field to /signal response dict in that worker
     confidence out of range  → must be float in [0.0, 1.0]
-    autohedge status wrong   → POST /execute must always return {"status": "advisory_only"}
+    analyst status wrong     → POST /execute must always return {"status": "advisory_only"}
     """
 
     def test_signal_response_is_a_list(self, signal_client):
@@ -722,16 +723,119 @@ class TestEndToEndSignalSchema:
             )
         print(f"\n  [{name}] signal fields OK: {sorted(signals[0].keys())}")
 
-    def test_autohedge_execute_always_advisory_only(self):
-        """AutoHedge must never execute a trade — always returns advisory_only status."""
-        c = _make_client("autohedge", "workers/autohedge/worker_api.py")
+    def test_analyst_execute_always_advisory_only(self):
+        """Analyst must never execute a trade — always returns advisory_only status."""
+        c = _make_client("analyst", "workers/analyst/worker_api.py")
         resp = c.post("/execute", json={"ticker": "BTC/USDT", "action": "buy"})
         assert resp.status_code == 200, \
-            f"autohedge POST /execute → HTTP {resp.status_code}\n  body: {resp.text[:300]}"
+            f"analyst POST /execute → HTTP {resp.status_code}\n  body: {resp.text[:300]}"
         body = resp.json()
         assert body.get("status") == "advisory_only", (
-            f"AutoHedge /execute must return {{\"status\": \"advisory_only\"}}\n"
+            f"Analyst /execute must return {{\"status\": \"advisory_only\"}}\n"
             f"  got: {body}\n"
-            f"  FIX: POST /execute in autohedge/worker_api.py must always set status='advisory_only'"
+            f"  FIX: POST /execute in analyst/worker_api.py must always set status='advisory_only'"
         )
-        print(f"\n  [autohedge] /execute correctly advisory_only: {body}")
+        print(f"\n  [analyst] /execute correctly advisory_only: {body}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. Prometheus /metrics format
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestPrometheusMetricsFormat:
+    """
+    Verify that /metrics on hypervisor and workers:
+      - Returns HTTP 200
+      - Returns plain text (not JSON-encoded string)
+      - Contains the required gauge names with labels
+
+    FAILURE GUIDE
+    ─────────────
+    Starts with '"'   → endpoint returns bare string, not Response(content=...,
+                        media_type="text/plain"). Known bug pattern from CLAUDE.md §5.
+    Missing gauge     → gauge was not added to the /metrics output for that worker.
+    """
+
+    def test_hypervisor_metrics_contains_regime_label_and_cycle_duration(self):
+        """Hypervisor /metrics must emit mara_regime_label and mara_cycle_duration_ms."""
+        from fastapi.testclient import TestClient as _TC
+        hyp_mod = _load_module("hypervisor/main.py")
+        client  = _TC(hyp_mod.app)
+
+        resp = client.get("/metrics")
+        assert resp.status_code == 200, \
+            f"GET /metrics → HTTP {resp.status_code}\n  body: {resp.text[:300]}"
+
+        text = resp.text
+
+        # Must be plain text — no JSON encoding
+        assert not text.startswith('"'), (
+            "Hypervisor /metrics returned a JSON-encoded string.\n"
+            "  FIX: return Response(content=..., media_type='text/plain')\n"
+            f"  got: {text[:80]!r}"
+        )
+
+        assert "mara_regime_label" in text, (
+            "mara_regime_label not found in hypervisor /metrics.\n"
+            f"  output snippet: {text[:500]}"
+        )
+        assert "mara_cycle_duration_ms" in text, (
+            "mara_cycle_duration_ms not found in hypervisor /metrics.\n"
+            f"  output snippet: {text[:500]}"
+        )
+        print(f"\n  Hypervisor /metrics OK — regime_label and cycle_duration_ms present")
+
+    def test_nautilus_metrics_contains_standard_worker_gauges(self):
+        """Nautilus /metrics must emit mara_worker_pnl_usd and mara_worker_open_positions."""
+        client = _make_client("nautilus", "workers/nautilus/worker_api.py")
+
+        resp = client.get("/metrics")
+        assert resp.status_code == 200, \
+            f"GET /metrics → HTTP {resp.status_code}\n  body: {resp.text[:300]}"
+
+        text = resp.text
+
+        assert not text.startswith('"'), (
+            "Nautilus /metrics returned a JSON-encoded string (bare string return bug).\n"
+            f"  got: {text[:80]!r}"
+        )
+        assert 'mara_worker_pnl_usd{worker="nautilus"}' in text, (
+            "mara_worker_pnl_usd{worker=\"nautilus\"} not in nautilus /metrics.\n"
+            f"  output: {text[:500]}"
+        )
+        assert 'mara_worker_open_positions{worker="nautilus"}' in text, (
+            "mara_worker_open_positions{worker=\"nautilus\"} not in nautilus /metrics.\n"
+            f"  output: {text[:500]}"
+        )
+        print(f"\n  Nautilus /metrics OK — standard worker gauges present")
+
+    def test_no_worker_metrics_endpoint_returns_json_encoded_string(self):
+        """
+        None of the worker /metrics endpoints may return a JSON-encoded string.
+        A bare string return in FastAPI gets double-quoted:  '"metric 1.0\\n"'
+        which breaks Prometheus parsing. All must return Response(content=...).
+        """
+        workers_to_check = [
+            ("nautilus",       "workers/nautilus/worker_api.py"),
+            ("arbitrader",     "workers/arbitrader/sidecar/main.py"),
+            ("analyst",        "workers/analyst/worker_api.py"),
+            ("core_dividends", "workers/core_dividends/worker_api.py"),
+        ]
+        bad = []
+        for name, path in workers_to_check:
+            client = _make_client(name, path)
+            resp   = client.get("/metrics")
+            if resp.status_code != 200:
+                bad.append(f"{name}: HTTP {resp.status_code}")
+                continue
+            if resp.text.startswith('"'):
+                bad.append(
+                    f"{name}: JSON-encoded string — starts with '\"'\n"
+                    f"    got: {resp.text[:80]!r}"
+                )
+
+        assert not bad, (
+            "The following workers return JSON-encoded /metrics output:\n"
+            + "\n".join(f"  • {b}" for b in bad)
+            + "\n  FIX: return Response(content=..., media_type='text/plain')"
+        )

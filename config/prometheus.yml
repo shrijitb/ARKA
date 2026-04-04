@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: mara-hypervisor
+    static_configs:
+      - targets: ['hypervisor:8000']
+
+  - job_name: mara-nautilus
+    static_configs:
+      - targets: ['worker-nautilus:8001']
+
+  - job_name: mara-polymarket
+    static_configs:
+      - targets: ['worker-polymarket:8002']
+
+  - job_name: mara-autohedge
+    static_configs:
+      - targets: ['worker-autohedge:8003']
+
+  - job_name: mara-arbitrader
+    static_configs:
+      - targets: ['worker-arbitrader:8004']
+
+  - job_name: mara-core-dividends
+    static_configs:
+      - targets: ['worker-core-dividends:8006']

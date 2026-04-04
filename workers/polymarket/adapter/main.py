@@ -288,13 +288,29 @@ async def resume():
 
 @app.get("/metrics")
 def metrics():
-    active = 0 if (state.paused or not state.is_healthy()) else 1
-    exposure = state.get_exposure()
-    pnl = state.last_metrics.get("pm_mm_profit_usd", 0.0)
-    content = (
-        f'mara_worker_active{{worker="polymarket"}} {active}\n'
-        f'mara_polymarket_exposure_usd {exposure:.4f}\n'
-        f'mara_polymarket_pnl_usd {pnl:.4f}\n'
-        f'mara_polymarket_skew {state.get_skew():.4f}\n'
-    )
+    active     = 0 if (state.paused or not state.is_healthy()) else 1
+    paused_int = 1 if state.paused else 0
+    exposure   = state.get_exposure()
+    pnl        = state.last_metrics.get("pm_mm_profit_usd", 0.0)
+    alloc      = getattr(state, "allocated_usd", 0.0)
+    fill_rate  = state.last_metrics.get("pm_mm_orders_filled_total", 0.0)
+
+    lines = [
+        # ── Standard labeled gauges ──────────────────────────────────────────
+        f'mara_worker_pnl_usd{{worker="polymarket"}} {pnl:.4f}',
+        f'mara_worker_allocated_usd{{worker="polymarket"}} {alloc:.2f}',
+        f'mara_worker_sharpe{{worker="polymarket"}} 0.0',
+        # Polymarket positions = exposure / avg_price — tracked as 1 if active
+        f'mara_worker_open_positions{{worker="polymarket"}} {1 if exposure != 0.0 else 0}',
+        f'mara_worker_paused{{worker="polymarket"}} {paused_int}',
+        # ── Legacy ───────────────────────────────────────────────────────────
+        f'mara_worker_active{{worker="polymarket"}} {active}',
+        f'mara_polymarket_exposure_usd {exposure:.4f}',
+        f'mara_polymarket_pnl_usd {pnl:.4f}',
+        f'mara_polymarket_skew {state.get_skew():.4f}',
+        # ── Execution quality ────────────────────────────────────────────────
+        f'mara_observed_slippage_bps{{worker="polymarket",symbol="POLYMARKET_MM",paper_mode="true"}} 0',
+        f'mara_fill_rate_observed{{worker="polymarket",symbol="POLYMARKET_MM",paper_mode="true"}} {fill_rate:.4f}',
+    ]
+    content = "\n".join(lines) + "\n"
     return Response(content=content, media_type="text/plain")

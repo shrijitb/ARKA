@@ -12,7 +12,7 @@ Worker keys match docker-compose service names exactly:
     arbitrader      — Java cross-exchange price arb (delta-neutral, port 8004)
     nautilus        — NautilusTrader strategies incl. MACD/Fractals swing (port 8001)
     polymarket      — CLOB market-making (port 8002)
-    autohedge       — AI advisory pipeline, Director+Quant+Risk (port 8003)
+    analyst         — Regime-aware advisory via Ollama phi3:mini (port 8003)
     core_dividends  — Passive dividend sleeve: SCHD + VYM buy-and-hold (port 8006)
 
 NOTE: swing_trend is NOT a separate worker. Swing strategies run inside
@@ -31,12 +31,12 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         # Arbitrader: funding rates spike in geopolitical stress — best risk/reward
         # Nautilus: swing strategies ride defense/commodity momentum; backtest confirms
         # Polymarket: war/election prediction markets are maximally active
-        # AutoHedge: advisory paused — high uncertainty degrades model output quality
+        # Analyst: advisory paused — high uncertainty degrades model output quality
         # core_dividends: 20% passive sleeve — SCHD/VYM hold through volatility
         "arbitrader":     0.36,
         "nautilus":       0.20,
         "polymarket":     0.24,
-        "autohedge":      0.00,
+        "analyst":        0.00,
         "core_dividends": 0.20,
     },
 
@@ -48,7 +48,7 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         "arbitrader":     0.40,
         "nautilus":       0.10,
         "polymarket":     0.20,
-        "autohedge":      0.00,
+        "analyst":        0.00,
         "core_dividends": 0.00,
     },
 
@@ -60,7 +60,7 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         "arbitrader":     0.20,
         "nautilus":       0.36,
         "polymarket":     0.16,
-        "autohedge":      0.08,
+        "analyst":        0.08,
         "core_dividends": 0.20,
     },
 
@@ -72,7 +72,7 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         "arbitrader":     0.28,
         "nautilus":       0.36,
         "polymarket":     0.08,
-        "autohedge":      0.08,
+        "analyst":        0.08,
         "core_dividends": 0.20,
     },
 
@@ -82,7 +82,7 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         "arbitrader":     0.32,
         "nautilus":       0.24,
         "polymarket":     0.16,
-        "autohedge":      0.08,
+        "analyst":        0.08,
         "core_dividends": 0.20,
     },
 
@@ -91,7 +91,7 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         "arbitrader":     0.32,
         "nautilus":       0.28,
         "polymarket":     0.12,
-        "autohedge":      0.08,
+        "analyst":        0.08,
         "core_dividends": 0.20,
     },
 
@@ -100,7 +100,7 @@ REGIME_PROFILES: Dict[str, Dict[str, float]] = {
         "arbitrader":     0.24,
         "nautilus":       0.36,
         "polymarket":     0.08,
-        "autohedge":      0.12,
+        "analyst":        0.12,
         "core_dividends": 0.20,
     },
 }

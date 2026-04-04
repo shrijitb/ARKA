@@ -508,11 +508,25 @@ def resume():
 
 @app.get("/metrics")
 def metrics():
-    active  = 0 if state.paused else 1
-    backend = 1.0 if state.agents_ready else 0.0
-    return (
-        f'mara_worker_active{{worker="autohedge"}} {active}\n'
-        f'mara_autohedge_agents_ready {backend}\n'
-        f'mara_autohedge_signals_total {state.signals_generated}\n'
-        f'mara_autohedge_uptime_seconds {state.uptime_seconds():.1f}\n'
-    )
+    from fastapi.responses import Response as _Response
+    active     = 0 if state.paused else 1
+    paused_int = 1 if state.paused else 0
+    backend    = 1.0 if state.agents_ready else 0.0
+    alloc      = getattr(state, "allocated_usd", 0.0)
+
+    lines = [
+        # ── Standard labeled gauges ──────────────────────────────────────────
+        # AutoHedge is advisory-only: pnl always 0, no positions
+        f'mara_worker_pnl_usd{{worker="autohedge"}} 0.0',
+        f'mara_worker_allocated_usd{{worker="autohedge"}} {alloc:.2f}',
+        f'mara_worker_sharpe{{worker="autohedge"}} 0.0',
+        f'mara_worker_open_positions{{worker="autohedge"}} 0',
+        f'mara_worker_paused{{worker="autohedge"}} {paused_int}',
+        # ── Legacy ───────────────────────────────────────────────────────────
+        f'mara_worker_active{{worker="autohedge"}} {active}',
+        f'mara_autohedge_agents_ready {backend}',
+        f'mara_autohedge_signals_total {state.signals_generated}',
+        f'mara_autohedge_uptime_seconds {state.uptime_seconds():.1f}',
+    ]
+    content = "\n".join(lines) + "\n"
+    return _Response(content=content, media_type="text/plain")

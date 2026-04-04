@@ -390,13 +390,27 @@ def resume():
 
 @app.get("/metrics")
 def metrics():
-    active = 0 if (state.paused or state.multiplier == 0.0) else 1
-    content = (
-        f'mara_worker_active{{worker="arbitrader"}} {active}\n'
-        f'mara_arbitrader_pnl_usd {state.realised_pnl:.4f}\n'
-        f'mara_arbitrader_trade_count {state.trade_count}\n'
-        f'mara_arbitrader_sharpe {state.sharpe():.4f}\n'
-        f'mara_arbitrader_win_rate {state.win_rate():.4f}\n'
-        f'mara_arbitrader_jvm_running {1 if state.jvm_running else 0}\n'
-    )
+    active     = 0 if (state.paused or state.multiplier == 0.0) else 1
+    paused_int = 1 if state.paused else 0
+
+    lines = [
+        # ── Standard labeled gauges ──────────────────────────────────────────
+        f'mara_worker_pnl_usd{{worker="arbitrader"}} {state.realised_pnl:.4f}',
+        f'mara_worker_allocated_usd{{worker="arbitrader"}} {state.allocated_usd:.2f}',
+        f'mara_worker_sharpe{{worker="arbitrader"}} {state.sharpe():.4f}',
+        # Arbitrader is delta-neutral: open_positions stays 0 until live JVM wired
+        f'mara_worker_open_positions{{worker="arbitrader"}} {state.open_positions}',
+        f'mara_worker_paused{{worker="arbitrader"}} {paused_int}',
+        # ── Legacy ───────────────────────────────────────────────────────────
+        f'mara_worker_active{{worker="arbitrader"}} {active}',
+        f'mara_arbitrader_pnl_usd {state.realised_pnl:.4f}',
+        f'mara_arbitrader_trade_count {state.trade_count}',
+        f'mara_arbitrader_sharpe {state.sharpe():.4f}',
+        f'mara_arbitrader_win_rate {state.win_rate():.4f}',
+        f'mara_arbitrader_jvm_running {1 if state.jvm_running else 0}',
+        # ── Execution quality — arb is delta-neutral, no per-position slippage
+        f'mara_observed_slippage_bps{{worker="arbitrader",symbol="CROSS_EXCHANGE_ARB",paper_mode="true"}} 0',
+        f'mara_fill_rate_observed{{worker="arbitrader",symbol="CROSS_EXCHANGE_ARB",paper_mode="true"}} 1.0',
+    ]
+    content = "\n".join(lines) + "\n"
     return Response(content=content, media_type="text/plain")

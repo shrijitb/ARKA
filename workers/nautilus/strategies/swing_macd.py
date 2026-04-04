@@ -40,11 +40,18 @@ config.py to pull real Binance candles via ccxt.
 import time
 import logging
 import numpy as np
+import pandas as pd
 from typing import Dict, List, Optional, Any, Tuple
 
 import config
 from workers.base_worker import BaseWorker
 from core.portfolio_state import PortfolioState, Position, PositionSide, WorkerType
+
+try:
+    from indicators.adx import AdxCalculator as _AdxCalculator
+    _adx_calc = _AdxCalculator(period=14)
+except ImportError:
+    _adx_calc = None
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +93,10 @@ class SwingTrendWorker(BaseWorker):
         # OHLCV cache — refreshed every SWING_CACHE_TTL seconds
         self._ohlcv_cache:      Dict[str, dict]        = {}
         self._cache_ttl:        float                  = config.SWING_CACHE_TTL_SEC
+
+        # ADX state — set by _evaluate_setup, read by _enter_position
+        self._last_adx_value:   float                  = 0.0
+        self._last_adx_state:   str                    = "unknown"
 
     # ─────────────────────────────────────────────────────────────────────────
     # BaseWorker Interface
@@ -211,6 +222,34 @@ class SwingTrendWorker(BaseWorker):
         closes = np.array([c[4] for c in ohlcv], dtype=np.float64)
         highs  = np.array([c[2] for c in ohlcv], dtype=np.float64)
         lows   = np.array([c[3] for c in ohlcv], dtype=np.float64)
+
+        # ── ADX gate — suppress signals in ranging/ambiguous markets ─────────
+        adx_value = 0.0
+        adx_state = "unknown"
+        if _adx_calc is not None and len(ohlcv) >= 30:
+            try:
+                opens = np.array([c[1] for c in ohlcv], dtype=np.float64)
+                vols  = np.array([c[5] for c in ohlcv], dtype=np.float64)
+                df_adx = pd.DataFrame({
+                    "open": opens, "high": highs, "low": lows,
+                    "close": closes, "volume": vols,
+                })
+                df_adx = _adx_calc.calculate(df_adx)
+                adx_value = float(df_adx["adx"].iloc[-1])
+                adx_state = _adx_calc.classify(adx_value)
+            except Exception as exc:
+                logger.debug(f"SwingTrend: ADX calculation failed for {pair}: {exc}")
+                adx_state = "unknown"
+
+            if adx_state in ("ranging", "ambiguous"):
+                logger.debug(
+                    f"SwingTrend: ADX gate suppressed signal for {pair} "
+                    f"(adx={adx_value:.1f}, state={adx_state})"
+                )
+                return None
+
+        self._last_adx_value = adx_value
+        self._last_adx_state = adx_state
 
         # ── Indicators ────────────────────────────────────────────────────────
         macd_line, signal_line, histogram = self._calculate_macd(
@@ -419,6 +458,8 @@ class SwingTrendWorker(BaseWorker):
             "risk_usd":    round(risk_usd, 2),
             "reward_usd":  round(reward_usd, 2),
             "rr_ratio":    round(rr_ratio, 2),
+            "adx_value":   round(self._last_adx_value, 2),
+            "adx_state":   self._last_adx_state,
         }
 
     def _manage_position(

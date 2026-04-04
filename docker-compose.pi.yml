@@ -1,0 +1,8 @@
+services:
+  hypervisor:
+    environment:
+      CYCLE_INTERVAL_SEC: "120"
+  ollama:
+    environment:
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
