@@ -1,0 +1,3 @@
+[submodule "arbitrader-src"]
+	path = workers/arbitrader/src
+	url = https://github.com/agonyforge/arbitrader
