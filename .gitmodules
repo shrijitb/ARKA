@@ -1,0 +1,6 @@
+[submodule "arbitrader-src"]
+	path = workers/arbitrader/src
+	url = https://github.com/agonyforge/arbitrader
+[submodule "polymarket-src"]
+	path = workers/polymarket/src
+	url = https://github.com/lorine93s/polymarket-market-maker-bot
