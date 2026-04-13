@@ -22,3 +22,6 @@ edgartools>=3.0.0
 gdeltdoc>=1.5.0
 instructor>=1.7.0
 websockets>=12.0
+# New OSINT sources (April 2026)
+# scrapegraphai>=1.11.0  — optional; install separately + playwright install chromium
+#                          falls back to snippet extraction when not present

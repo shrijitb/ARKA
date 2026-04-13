@@ -1,6 +1,6 @@
 # MARA Hardware Distribution Guide
 
-For selling Raspberry Pi devices with MARA preloaded (with or without custom cases).
+For selling Raspberry Pi devices with ARKA preloaded (with or without custom cases).
 
 ---
 
@@ -45,7 +45,7 @@ Include one of these:
 
 ```
 ╔═══════════════════════════════════════════════════════════╗
-║  MARA Autonomous Trading System                          ║
+║  MARA Autonomous Trading System                           ║
 ║  Quick Start Guide                                        ║
 ╚═══════════════════════════════════════════════════════════╝
 
@@ -92,14 +92,13 @@ You have the right to:
 ✓ Redistribute under the same terms
 
 See LICENSE file on the SD card for details.
-Source code: https://github.com/[your-org]/mara
+Source code: https://github.com/shrijitb/mara
 
 ═══════════════════════════════════════════════════════════
 
 SUPPORT
-• Documentation: https://github.com/[your-org]/mara/wiki
-• Issues: https://github.com/[your-org]/mara/issues
-• Community: [Discord/Slack link]
+• Documentation: https://github.com/shrijitb/mara/wiki
+• Issues: https://github.com/shrijitb/mara/issues
 
 ═══════════════════════════════════════════════════════════
 ```
@@ -223,7 +222,7 @@ License file included on SD card.
 
 ## Licensing Guarantee
 
-When you ship a device with MARA:
+When you ship a device with ARKA:
 
 1. **You are in full compliance** with LGPL-3.0 if:
    - [ ] LICENSE file is included
@@ -241,7 +240,7 @@ When you ship a device with MARA:
 
 3. **You do NOT need permission** to:
    - Modify NautilusTrader
-   - Customize MARA
+   - Customize ARKA
    - Sell devices
    - Keep modifications private
    - Charge for hardware
@@ -252,7 +251,7 @@ When you ship a device with MARA:
 
 ```bash
 # 1. Clone MARA repo
-git clone https://github.com/[your-org]/mara
+git clone https://github.com/shrijitb/mara
 cd mara
 
 # 2. Build ARM64 Docker images for Pi

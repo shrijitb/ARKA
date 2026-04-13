@@ -71,14 +71,18 @@ DEFENSE_ETFS       = ["ITA", "PPA", "SHLD", "NATO"]
 GOLD_OIL_BASELINE  = 35.0
 GOLD_OIL_WAR_LEVEL = 52.0
 
-# ── OSINT source base weights (sum = 100) ─────────────────────────────────────
+# ── OSINT source base weights (must sum to 1.0) ───────────────────────────────
+# April 2026: added aviation (0.12) and company_intel (0.08).
+# Existing weights scaled down proportionally to absorb the two new sources.
 _OSINT_BASE_WEIGHTS: dict[str, float] = {
-    "gdelt":       0.25,
-    "edgar":       0.25,
-    "ucdp":        0.15,
-    "maritime":    0.15,
-    "firms":       0.10,
-    "usgs":        0.10,
+    "gdelt":         0.20,   # geopolitical news articles
+    "edgar":         0.20,   # SEC 8-K filings + insider trading
+    "ucdp":          0.12,   # Uppsala academic conflict events
+    "maritime":      0.12,   # AIS vessel density at chokepoints
+    "firms":         0.08,   # NASA thermal anomalies (infrastructure fires)
+    "usgs":          0.08,   # USGS earthquake events
+    "aviation":      0.12,   # OpenSky military/VIP aircraft activity ← new
+    "company_intel": 0.08,   # SearXNG + ScrapeGraphAI deep research ← new
 }
 
 # Tier weights: market proxy vs OSINT layer
@@ -323,6 +327,33 @@ def _fetch_osint_layer() -> tuple[dict[str, float], float]:
     except Exception as exc:
         logger.debug(f"Environment feeds unavailable: {exc}")
 
+    # ── OpenSky Aviation ─────────────────────────────────────────────────────
+    try:
+        from data.feeds.aviation_client import fetch_aircraft_states, score_aviation
+        aviation_states = fetch_aircraft_states()
+        source_scores["aviation"] = score_aviation(aviation_states)
+    except Exception as exc:
+        logger.debug(f"Aviation feed unavailable: {exc}")
+
+    # ── Company Intelligence (SearXNG + ScrapeGraphAI) ────────────────────────
+    try:
+        from data.feeds.company_researcher import research_event, score_company_intel
+        # Derive a representative event context from the highest-scoring OSINT
+        # source seen so far (GDELT articles are the richest text source)
+        _gdelt_score = source_scores.get("gdelt", 0.0)
+        if _gdelt_score > 20:
+            # Only run expensive research pipeline when GDELT shows conflict signal
+            from data.feeds.gdelt_client import fetch_gdelt_articles
+            articles   = fetch_gdelt_articles(max_articles=3)
+            event_text = " ".join(
+                a.get("title", "") for a in articles[:3] if a.get("title")
+            )
+            if event_text:
+                profiles = research_event(event_text, max_companies=3)
+                source_scores["company_intel"] = score_company_intel(profiles)
+    except Exception as exc:
+        logger.debug(f"Company intel feed unavailable: {exc}")
+
     # ── Dynamic weight redistribution ─────────────────────────────────────────
     available      = set(source_scores.keys())
     redistributed  = _redistribute_weights(available)
@@ -349,7 +380,8 @@ def get_war_premium_score() -> float:
     """
     Composite War Premium Score 0-100.
     Tier 1: market proxy 50%.
-    Tier 2: OSINT layer 50% (6 sources, dynamic redistribution).
+    Tier 2: OSINT layer 50% (8 sources, dynamic redistribution).
+        gdelt, edgar, ucdp, maritime, firms, usgs, aviation, company_intel
     """
     market = _fetch_market_proxy()
     ms     = _score_market_proxy(market)
@@ -366,9 +398,10 @@ def get_war_premium_score() -> float:
 
 def get_osint_snapshot() -> "OSINTPipelineResult":
     """
-    Run all 6 OSINT sources through the extraction pipeline.
+    Run all 8 OSINT sources through the extraction pipeline.
     Returns OSINTPipelineResult with structured events + per-source scores.
 
+    Sources: gdelt, ucdp, edgar, maritime, firms, usgs, aviation, company_intel
     Used by the analyst worker for thesis generation.
     """
     try:
@@ -377,6 +410,8 @@ def get_osint_snapshot() -> "OSINTPipelineResult":
         from data.feeds.edgar_client import EdgarIntelClient
         from data.feeds.maritime_client import fetch_vessel_activity, detect_traffic_anomalies
         from data.feeds.environment_client import fetch_thermal_anomalies, fetch_earthquakes
+        from data.feeds.aviation_client import fetch_aircraft_states, detect_aviation_anomalies
+        from data.feeds.company_researcher import research_event
         from data.feeds.osint_processor import run_pipeline
 
         # Fetch raw data
@@ -386,19 +421,34 @@ def get_osint_snapshot() -> "OSINTPipelineResult":
         edgar_client   = EdgarIntelClient()
         loop           = asyncio.new_event_loop()
         try:
-            edgar_filings  = loop.run_until_complete(edgar_client.check_recent_8k_filings(hours_back=48))
-            insider_sigs   = loop.run_until_complete(edgar_client.check_insider_trading(days_back=7))
-            vessels    = []
+            edgar_filings = loop.run_until_complete(
+                edgar_client.check_recent_8k_filings(hours_back=48))
+            insider_sigs  = loop.run_until_complete(
+                edgar_client.check_insider_trading(days_back=7))
+            vessels = []
             if os.environ.get("AIS_API_KEY"):
-                vessels = loop.run_until_complete(fetch_vessel_activity(timeout_sec=10.0))
+                vessels = loop.run_until_complete(
+                    fetch_vessel_activity(timeout_sec=10.0))
         finally:
             loop.close()
 
-        maritime_anomalies = detect_traffic_anomalies(vessels)
-        firms_records      = []
+        maritime_anomalies  = detect_traffic_anomalies(vessels)
+        firms_records       = []
         if os.environ.get("NASA_FIRMS_API_KEY"):
-            firms_records  = fetch_thermal_anomalies(days_back=1)
-        quake_features     = fetch_earthquakes(days_back=3)
+            firms_records   = fetch_thermal_anomalies(days_back=1)
+        quake_features      = fetch_earthquakes(days_back=3)
+
+        # Aviation — always attempt (no API key required)
+        aviation_states     = fetch_aircraft_states()
+        aviation_anomalies  = detect_aviation_anomalies(aviation_states)
+
+        # Company intelligence — only when GDELT shows a conflict signal
+        company_profiles = []
+        gdelt_titles     = [a.get("title", "") for a in gdelt_articles[:3]
+                            if a.get("title")]
+        if gdelt_titles:
+            event_text       = " ".join(gdelt_titles)
+            company_profiles = research_event(event_text, max_companies=3)
 
         return run_pipeline(
             gdelt_articles     = gdelt_articles,
@@ -408,6 +458,8 @@ def get_osint_snapshot() -> "OSINTPipelineResult":
             maritime_anomalies = maritime_anomalies,
             firms_records      = firms_records,
             quake_features     = quake_features,
+            aviation_anomalies = aviation_anomalies,
+            company_profiles   = company_profiles,
         )
 
     except Exception as exc:

@@ -55,6 +55,8 @@ VALID_EVENT_TYPES = frozenset({
     "infrastructure_attack",
     "infrastructure_fire",
     "earthquake",
+    "military_aviation",      # unusual aircraft activity in/near conflict zone
+    "corporate_intelligence", # pre-retail company/supply-chain research
 })
 
 
@@ -428,22 +430,101 @@ def process_environment(firms_records: list[dict], quake_features: list[dict]) -
     return events
 
 
+# ── Aviation processor ────────────────────────────────────────────────────────
+
+# Map aviation anomaly_type → OSINTEvent escalation trajectory
+_AVIATION_TRAJECTORY: dict[str, str] = {
+    "military_surge":   "escalating",
+    "emergency_squawk": "escalating",
+    "mass_evacuation":  "escalating",
+    "isr_activity":     "escalating",
+    "vip_movement":     "stable",      # ambiguous — may be diplomatic
+}
+
+# Domains at risk per aviation anomaly type
+_AVIATION_DOMAINS: dict[str, list[str]] = {
+    "military_surge":   ["commodities", "crypto_perps"],
+    "emergency_squawk": ["commodities", "crypto_perps", "us_equities"],
+    "mass_evacuation":  ["us_equities", "commodities"],
+    "isr_activity":     ["commodities", "us_equities"],
+    "vip_movement":     ["prediction", "us_equities"],
+}
+
+
+def process_aviation(anomalies: list[dict]) -> list[OSINTEvent]:
+    """
+    Convert aviation anomaly dicts (from aviation_client.detect_aviation_anomalies)
+    to OSINTEvent objects.
+
+    Severity comes directly from the ZoneAnomalyFSM (already calibrated 0–9).
+    Regions are derived from the zone name.
+    """
+    events = []
+    for a in anomalies:
+        zone     = a.get("zone", "unknown").replace("_", " ")
+        anom     = a.get("anomaly_type", "military_surge")
+        sev_int  = max(1, min(9, a.get("severity_int", 4)))
+        traj     = _AVIATION_TRAJECTORY.get(anom, "stable")
+        domains  = _AVIATION_DOMAINS.get(anom, ["commodities"])
+        desc     = a.get("description", "")
+
+        events.append(OSINTEvent(
+            source                = "aviation",
+            event_type            = "military_aviation",
+            severity              = EventSeverity(sev_int),
+            escalation_trajectory = traj,
+            regions               = [zone],
+            commodities_affected  = ["oil"] if "commodities" in domains else [],
+            domains_at_risk       = a.get("domains", domains),
+            raw_text              = desc[:500],
+            confidence            = 0.75,   # OpenSky is real-time ADS-B — high quality
+            llm_extracted         = False,
+        ))
+    return events
+
+
+# ── Company intelligence processor ───────────────────────────────────────────
+
+def process_company_research(profiles: list) -> list[OSINTEvent]:
+    """
+    Convert CompanyRiskProfile objects (from company_researcher.research_event)
+    to OSINTEvent objects.
+
+    Delegates to company_researcher.process_company_research to avoid
+    duplicating the severity/trajectory mapping logic.
+    """
+    if not profiles:
+        return []
+    try:
+        from data.feeds.company_researcher import process_company_research as _convert
+        return _convert(profiles)
+    except Exception as exc:
+        logger.debug(f"company research processing failed: {exc}")
+        return []
+
+
 # ── Pipeline orchestrator ─────────────────────────────────────────────────────
 
 def run_pipeline(
-    gdelt_articles:    list[dict] | None = None,
-    ucdp_events:       list[dict] | None = None,
-    edgar_filings:     list[dict] | None = None,
-    insider_signals:   list[dict] | None = None,
-    maritime_anomalies: list[dict] | None = None,
-    firms_records:     list[dict] | None = None,
-    quake_features:    list[dict] | None = None,
+    gdelt_articles:      list[dict] | None = None,
+    ucdp_events:         list[dict] | None = None,
+    edgar_filings:       list[dict] | None = None,
+    insider_signals:     list[dict] | None = None,
+    maritime_anomalies:  list[dict] | None = None,
+    firms_records:       list[dict] | None = None,
+    quake_features:      list[dict] | None = None,
+    aviation_anomalies:  list[dict] | None = None,   # from aviation_client
+    company_profiles:    list       | None = None,   # list[CompanyRiskProfile]
 ) -> OSINTPipelineResult:
     """
     Aggregate all OSINT sources into a unified OSINTPipelineResult.
 
     Each source is optional — missing sources produce empty event lists
     and 0.0 scores (contributing to dynamic weight redistribution).
+
+    New sources (April 2026):
+        aviation_anomalies  — from aviation_client.detect_aviation_anomalies()
+        company_profiles    — from company_researcher.research_event()
     """
     from data.feeds.gdelt_client import score_gdelt_articles
     from data.feeds.ucdp_client import score_ucdp_events
@@ -451,20 +532,21 @@ def run_pipeline(
     from data.feeds.maritime_client import score_maritime
     from data.feeds.environment_client import score_environment
 
-    gdelt_articles    = gdelt_articles    or []
-    ucdp_events       = ucdp_events       or []
-    edgar_filings     = edgar_filings     or []
-    insider_signals   = insider_signals   or []
-    maritime_anomalies= maritime_anomalies or []
-    firms_records     = firms_records     or []
-    quake_features    = quake_features    or []
+    gdelt_articles     = gdelt_articles     or []
+    ucdp_events        = ucdp_events        or []
+    edgar_filings      = edgar_filings      or []
+    insider_signals    = insider_signals    or []
+    maritime_anomalies = maritime_anomalies or []
+    firms_records      = firms_records      or []
+    quake_features     = quake_features     or []
+    aviation_anomalies = aviation_anomalies or []
+    company_profiles   = company_profiles   or []
 
     all_events: list[OSINTEvent] = []
     source_scores: dict[str, float] = {}
 
     if gdelt_articles:
-        evs = process_gdelt(gdelt_articles)
-        all_events.extend(evs)
+        all_events.extend(process_gdelt(gdelt_articles))
         source_scores["gdelt"] = score_gdelt_articles(gdelt_articles)
     else:
         source_scores["gdelt"] = 0.0
@@ -483,7 +565,6 @@ def run_pipeline(
 
     if maritime_anomalies:
         all_events.extend(process_maritime(maritime_anomalies))
-        # maritime anomalies are already classified; compute score from them
         total_sev = sum(a.get("severity_int", 1) * 5 for a in maritime_anomalies)
         source_scores["maritime"] = min(100.0, float(total_sev))
     else:
@@ -494,6 +575,23 @@ def run_pipeline(
         source_scores["environment"] = score_environment(firms_records, quake_features)
     else:
         source_scores["environment"] = 0.0
+
+    if aviation_anomalies:
+        all_events.extend(process_aviation(aviation_anomalies))
+        total_sev = sum(a.get("severity_int", 1) * 6 for a in aviation_anomalies)
+        source_scores["aviation"] = min(100.0, float(total_sev))
+    else:
+        source_scores["aviation"] = 0.0
+
+    if company_profiles:
+        all_events.extend(process_company_research(company_profiles))
+        try:
+            from data.feeds.company_researcher import score_company_intel
+            source_scores["company_intel"] = score_company_intel(company_profiles)
+        except Exception:
+            source_scores["company_intel"] = 0.0
+    else:
+        source_scores["company_intel"] = 0.0
 
     logger.info(
         f"OSINT pipeline: {len(all_events)} events from {len(source_scores)} sources  "

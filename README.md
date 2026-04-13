@@ -4,6 +4,8 @@ An open-source, autonomous trading system for turbulent macro environments. MARA
 
 **Status**: Paper trading active (April 2026) | WAR_PREMIUM regime, 80% confidence | **License**: LGPL-3.0
 
+> **Branch: `arka-build-alpha`** — Arka dashboard, OSINT conflict index v2, Bayesian backtest optimizer, SearXNG integration, and modular worker refactor. Assisted by Claude (Anthropic) for organisation and modularity.
+
 ---
 
 ## Quick Start
@@ -59,10 +61,9 @@ MARA targets **futures, crypto, forex, ETFs, and prediction markets** in regime-
 
 A **FastAPI Hypervisor** orchestrates five specialized worker agents:
 
-- **Nautilus**: MACD + Fractals swing trading on OKX perps
-- **Polymarket**: CLOB market-making on prediction markets (stub until Phase 3)
-- **AutoHedge**: LLM-based advisory (phi3:mini via Ollama)
-- **Arbitrader**: Cross-exchange spread arbitrage (Java + Python sidecar)
+- **Nautilus**: ADX-routed strategy engine — MACD+Fractals for trending, mean-reversion for ranging
+- **Prediction Markets**: CLOB market-making on prediction markets (stub until Phase 3)
+- **Analyst**: LLM-based advisory (phi3:mini via Ollama + SearXNG web search)
 - **Core Dividends**: Passive SCHD + VYM ETF buy-and-hold sleeve
 
 Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACUTE, BEAR_RECESSION, etc.). The hypervisor includes:
@@ -99,31 +100,31 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
                            │ allocates + commands
      ┌─────────────────────┼──────────────────────────┐
      ▼                     ▼                          ▼
-┌──────────┐  ┌─────────────┐  ┌──────────┐  ┌────────────────┐
-│arbitrader│  │  nautilus   │  │autohedge │  │ core_dividends │
-│ port 8004│  │  port 8001  │  │ port 8003│  │   port 8006    │
-│ arb sim  │  │ MACD+Frac.  │  │phi3:mini │  │  SCHD+VYM hold │
-└──────────┘  └─────────────┘  └──────────┘  └────────────────┘
+┌─────────────┐  ┌──────────────────────┐  ┌────────────────┐
+│   nautilus  │  │  prediction-markets  │  │ core_dividends │
+│  port 8001  │  │      port 8002       │  │   port 8006    │
+│ ADX-routed  │  │     CLOB stub        │  │  SCHD+VYM hold │
+└─────────────┘  └──────────────────────┘  └────────────────┘
 
-┌──────────────┐  ┌──────────────┐  ┌─────────────────┐
-│ telegram-bot │  │    ollama    │  │   polymarket    │
-│  polling,    │  │  port 11434  │  │   port 8002     │
-│  no port     │  │  phi3:mini   │  │   CLOB stub     │
-└──────────────┘  └──────────────┘  └─────────────────┘
+┌──────────────┐  ┌────────────┐  ┌─────────────────────┐
+│ telegram-bot │  │   ollama   │  │       analyst       │
+│  polling,    │  │ port 11434 │  │      port 8003      │
+│   no port    │  │ phi3:mini  │  │ phi3:mini + searxng  │
+└──────────────┘  └────────────┘  └─────────────────────┘
 ```
 
 ### Worker Map
 
 | Container | Key | Port | Tech | Mode |
 |-----------|-----|------|------|------|
-| mara-hypervisor | — | 8000 | FastAPI | Orchestrator |
-| mara-nautilus | `nautilus` | 8001 | NautilusTrader | Paper sim (MACD + Fractals) |
-| mara-polymarket | `polymarket` | 8002 | Python CLOB | Stub — needs `POLY_PRIVATE_KEY` |
-| mara-autohedge | `autohedge` | 8003 | litellm + Ollama | phi3:mini advisory |
-| mara-arbitrader | `arbitrader` | 8004 | Java + Python sidecar | Paper arb sim |
-| mara-core-dividends | `core_dividends` | 8006 | FastAPI | Paper hold (SCHD + VYM) |
-| mara-ollama | — | 11434 | Ollama | phi3:mini CPU inference |
-| mara-telegram-bot | — | none | python-telegram-bot | Polling — no inbound port |
+| arka-hypervisor | — | 8000 | FastAPI | Orchestrator |
+| arka-nautilus | `nautilus` | 8001 | NautilusTrader | Paper sim (ADX-routed) |
+| arka-prediction-markets | `prediction_markets` | 8002 | Python CLOB | Stub — needs `POLY_PRIVATE_KEY` |
+| arka-analyst | `analyst` | 8003 | litellm + Ollama | phi3:mini + SearXNG advisory |
+| arka-core-dividends | `core_dividends` | 8006 | FastAPI | Paper hold (SCHD + VYM) |
+| arka-ollama | — | 11434 | Ollama | phi3:mini CPU inference |
+| arka-telegram-bot | — | none | python-telegram-bot | Polling — no inbound port |
+| arka-searxng | — | 8080 | SearXNG | Local web search for Analyst |
 | workers/stocksharp | — | 8005 | .NET 8 | Phase 3 only (IBKR routing) |
 
 ---
@@ -132,15 +133,15 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
 
 The classifier outputs one of 7 regime labels. Capital is split across workers per profile, with a cash buffer enforced at all times. Weights normalise against the sum of all non-zero profile entries — not just healthy workers — so a single worker starting up cannot absorb more than its intended share.
 
-| Regime | arbitrader | nautilus | polymarket | autohedge | core_dividends | Max deploy |
-|--------|-----------|---------|-----------|----------|----------------|-----------|
-| `WAR_PREMIUM` | 36% | 20% | 24% | 0% | 20% | 70% |
-| `CRISIS_ACUTE` | 40% | 10% | 20% | 0% | 0% | 50% |
-| `BEAR_RECESSION` | 20% | 36% | 16% | 8% | 20% | 75% |
-| `BULL_FROTHY` | 28% | 36% | 8% | 8% | 20% | 80% |
-| `REGIME_CHANGE` | 32% | 24% | 16% | 8% | 20% | 70% |
-| `SHADOW_DRIFT` | 32% | 28% | 12% | 8% | 20% | 75% |
-| `BULL_CALM` | 24% | 36% | 8% | 12% | 20% | 80% |
+| Regime | nautilus | prediction_markets | analyst | core_dividends | Max deploy |
+|--------|---------|-------------------|---------|----------------|-----------|
+| `WAR_PREMIUM` | 36% | 24% | 0% | 20% | 70% |
+| `CRISIS_ACUTE` | 40% | 20% | 0% | 0% | 50% |
+| `BEAR_RECESSION` | 36% | 16% | 8% | 20% | 75% |
+| `BULL_FROTHY` | 36% | 8% | 8% | 20% | 80% |
+| `REGIME_CHANGE` | 24% | 16% | 8% | 20% | 70% |
+| `SHADOW_DRIFT` | 28% | 12% | 8% | 20% | 75% |
+| `BULL_CALM` | 36% | 8% | 12% | 20% | 80% |
 
 Priority order (first match wins): `WAR_PREMIUM > CRISIS_ACUTE > BEAR_RECESSION > BULL_FROTHY > REGIME_CHANGE > SHADOW_DRIFT > BULL_CALM`
 
@@ -460,8 +461,8 @@ curl -s http://localhost:8000/status | python3 -m json.tool
 curl -s http://localhost:8000/regime
 curl -s http://localhost:8000/watchlist
 curl -s http://localhost:8001/health   # nautilus
-curl -s http://localhost:8003/health   # autohedge
-curl -s http://localhost:8004/metrics  # arbitrader prometheus
+curl -s http://localhost:8002/health   # prediction-markets
+curl -s http://localhost:8003/health   # analyst
 curl -s http://localhost:8006/health   # core_dividends
 ```
 
@@ -505,7 +506,7 @@ curl -s http://localhost:8000/status | python3 -m json.tool
 
 | Class | What it tests | Status |
 |-------|--------------|--------|
-| `TestWorkerContract` | nautilus + arbitrader REST contract endpoints | Pass |
+| `TestWorkerContract` | nautilus + analyst REST contract endpoints | Pass |
 | `TestCapitalAllocator` | dollar splits, Sharpe penalty, cold-start single-worker cap regression | Pass |
 | `TestRiskManagerIntegration` | all 7 risk limits, cooldown, re-allocation peak-reset regression | 10/10 pass |
 | `TestHypervisorCycle` | registry keys, capital math, classifier shape | 4/4 pass |
@@ -518,7 +519,7 @@ curl -s http://localhost:8000/status | python3 -m json.tool
 
 ### Expected skips
 
-- `autohedge` and `polymarket` contract tests — `litellm` / `py_clob_client` not in venv (pass in Docker)
+- `analyst` and `prediction_markets` contract tests — `litellm` / `py_clob_client` not in venv (pass in Docker)
 - ACLED CAST + live events — free tier 403 is permanent, not a bug
 
 ---
@@ -595,12 +596,14 @@ The `RiskManager` enforces these limits every cycle. A breach triggers a 1-hour 
 | F-02 | Passive dividend sleeve (`core_dividends`) | Done | SCHD + VYM paper hold, port 8006 |
 | F-03 | Inverse ETF recession signals (SH, PSQ) | Done | Advisory-only until IBKR wired (Phase 3) |
 | F-04 | Quarterly profit sweep skeleton | Done | APScheduler cron Jan/Apr/Jul/Oct 7th @ 09:00 |
-| F-05 | AutoHedge binary sanity check | Waiting | Implement after 1–2 weeks phi3:mini observation |
-| F-06 | Polymarket far-book live test | Blocked | Requires `POLY_PRIVATE_KEY` |
-| F-07 | AutoHedge sentiment multiplier (1.1×/0.5×) | Parked | High complexity; wait for F-05 stable |
-| F-08 | AutoHedge + GDELT dynamic watchlist | Parked | High complexity |
+| F-05 | Analyst binary sanity check | Waiting | Implement after 1–2 weeks phi3:mini observation |
+| F-06 | Prediction Markets far-book live test | Blocked | Requires `POLY_PRIVATE_KEY` |
+| F-07 | Analyst sentiment multiplier (1.1×/0.5×) | Parked | High complexity; wait for F-05 stable |
+| F-08 | Analyst + GDELT dynamic watchlist | Parked | High complexity |
 | F-09 | NautilusTrader full backtest harness | Parked | After 4+ weeks paper trading data |
 | F-10 | Arka Visual Dashboard | Done | React 18 + Tailwind v4 at `dashboard/` |
+
+> **Session continuity:** [`FUTURE_WORK.md`](./FUTURE_WORK.md) contains copy-paste prompts for the next Claude Code session covering F-05, F-06, Pi deploy, Phase 3 wiring, optimizer wiring, and observability.
 
 ---
 
@@ -723,12 +726,11 @@ curl -s http://localhost:8000/status | python3 -m json.tool
 Use Docker DNS names, overridable via env vars. Never hardcode `localhost` or IPs — they break on Pi and across Docker networks.
 
 ```
-NAUTILUS_URL        http://worker-nautilus:8001
-POLYMARKET_URL      http://worker-polymarket:8002
-AUTOHEDGE_URL       http://worker-autohedge:8003
-ARBITRADER_URL      http://worker-arbitrader:8004
-CORE_DIVIDENDS_URL  http://worker-core-dividends:8006
-HYPERVISOR_URL      http://hypervisor:8000
+NAUTILUS_URL            http://worker-nautilus:8001
+PREDICTION_MARKETS_URL  http://worker-prediction-markets:8002
+ANALYST_URL             http://worker-analyst:8003
+CORE_DIVIDENDS_URL      http://worker-core-dividends:8006
+HYPERVISOR_URL          http://hypervisor:8000
 ```
 
 ### Key design decisions
@@ -837,9 +839,8 @@ mara/
 │   ├── nautilus/
 │   │   ├── worker_api.py                # FastAPI port 8001, paper sim
 │   │   └── strategies/swing_macd.py     # MACD + Bullish Fractal strategy
-│   ├── polymarket/adapter/main.py       # FastAPI port 8002, CLOB stub
-│   ├── autohedge/worker_api.py          # FastAPI port 8003, phi3:mini advisory
-│   ├── arbitrader/sidecar/main.py       # FastAPI port 8004, JVM lifecycle
+│   ├── prediction_markets/worker_api.py # FastAPI port 8002, CLOB stub
+│   ├── analyst/worker_api.py            # FastAPI port 8003, phi3:mini + SearXNG advisory
 │   ├── core_dividends/worker_api.py     # FastAPI port 8006, SCHD+VYM hold
 │   ├── telegram_bot/main.py             # Polling bot, no port
 │   └── stocksharp/                      # Phase 3 only — .NET 8 IBKR router

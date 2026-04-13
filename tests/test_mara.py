@@ -158,8 +158,10 @@ class TestDynamicWeightRedistribution:
         from data.feeds.conflict_index import _OSINT_BASE_WEIGHTS
         w = self.redistribute({"gdelt", "ucdp"})
         assert abs(sum(w.values()) - 1.0) < 1e-9
-        # gdelt base=0.25, ucdp base=0.15 → ratio 25:15 = 5:3
-        expected_gdelt = 0.25 / (0.25 + 0.15)
+        # ratio must equal base_gdelt / (base_gdelt + base_ucdp) regardless of values
+        base_gdelt = _OSINT_BASE_WEIGHTS["gdelt"]
+        base_ucdp  = _OSINT_BASE_WEIGHTS["ucdp"]
+        expected_gdelt = base_gdelt / (base_gdelt + base_ucdp)
         assert abs(w["gdelt"] - expected_gdelt) < 1e-9
 
     def test_empty_sources_returns_empty(self):
@@ -1195,6 +1197,706 @@ class TestFactorModel:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ZoneAnomalyFSM — finite state machine tests
+#
+# The FSM has 5 states and the following valid transition graph:
+#
+#   NORMAL     → ELEVATED, EMERGENCY*, EVACUATING*
+#   ELEVATED   → NORMAL,   SURGE,      EMERGENCY*, EVACUATING*
+#   SURGE      → ELEVATED, NORMAL,     EMERGENCY*
+#   EMERGENCY  → SURGE,    ELEVATED,   NORMAL
+#   EVACUATING → NORMAL,   SURGE,      ELEVATED
+#
+# * EMERGENCY and EVACUATING transitions are immediate (binary detections).
+#   All other escalations (NORMAL→ELEVATED, ELEVATED→SURGE, etc.) require
+#   two consecutive readings to confirm (debouncing ADS-B noise).
+#   All de-escalations are immediate (safety-first).
+#
+# Coverage: all 14 valid edges, confirmation logic, invalid transitions,
+#           boundary inputs, reset(), severity property.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestZoneAnomalyFSM:
+    """FSM state-transition coverage — no network, no I/O."""
+
+    # baseline=4  →  elevated threshold: max(1, 4*1.5)=6, surge threshold: 4*2.5=10
+    BASELINE = 4
+
+    def _fsm(self):
+        from data.feeds.aviation_client import ZoneAnomalyFSM
+        return ZoneAnomalyFSM("test_zone", self.BASELINE)
+
+    def _eval(self, fsm, *, mil=0, squawk=False, evac=0, isr=False, vip=False):
+        return fsm.evaluate(
+            military_count       = mil,
+            has_emergency_squawk = squawk,
+            evac_count           = evac,
+            has_isr              = isr,
+            has_vip              = vip,
+        )
+
+    # ── Initial state ─────────────────────────────────────────────────────────
+
+    def test_initial_state_is_normal(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        assert fsm.state   == ZoneState.NORMAL
+        assert fsm.severity == 0
+
+    # ── NORMAL → EMERGENCY (immediate — binary detection) ────────────────────
+
+    def test_normal_to_emergency_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm   = self._fsm()
+        state = self._eval(fsm, squawk=True)
+        assert state == ZoneState.EMERGENCY, \
+            "EMERGENCY squawk must trigger without confirmation reading"
+
+    # ── NORMAL → EVACUATING (immediate — binary detection) ───────────────────
+
+    def test_normal_to_evacuating_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm   = self._fsm()
+        state = self._eval(fsm, evac=3)
+        assert state == ZoneState.EVACUATING, \
+            "Mass EVAC (≥3 callsigns) must trigger without confirmation reading"
+
+    def test_evacuating_requires_threshold(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        # evac=2 is below the threshold of 3 — must stay NORMAL after 2 readings
+        self._eval(fsm, evac=2)
+        state = self._eval(fsm, evac=2)
+        assert state == ZoneState.NORMAL
+
+    # ── NORMAL → ELEVATED (requires 2 readings) ──────────────────────────────
+
+    def test_normal_to_elevated_needs_two_readings(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        # First reading: stays NORMAL (pending set)
+        s1 = self._eval(fsm, mil=6)
+        assert s1 == ZoneState.NORMAL, "First elevated reading must not escalate"
+        # Second reading: commits to ELEVATED
+        s2 = self._eval(fsm, mil=6)
+        assert s2 == ZoneState.ELEVATED
+
+    def test_pending_escalation_resets_on_different_target(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        # First reading suggests ELEVATED
+        self._eval(fsm, mil=6)
+        assert fsm._pending == ZoneState.ELEVATED
+        # Next reading drops back to NORMAL input — pending must clear
+        self._eval(fsm, mil=0)
+        assert fsm._pending is None
+        assert fsm.state == ZoneState.NORMAL
+
+    def test_normal_elevated_via_isr(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, isr=True)
+        state = self._eval(fsm, isr=True)
+        assert state == ZoneState.ELEVATED
+
+    def test_normal_elevated_via_vip(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, vip=True)
+        state = self._eval(fsm, vip=True)
+        assert state == ZoneState.ELEVATED
+
+    # ── ELEVATED → SURGE (requires 2 readings) ───────────────────────────────
+
+    def test_elevated_to_surge_needs_two_readings(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        # Bring to ELEVATED (2 readings)
+        self._eval(fsm, mil=6); self._eval(fsm, mil=6)
+        assert fsm.state == ZoneState.ELEVATED
+        # Surge: 4 * 2.5 = 10; first reading
+        s1 = self._eval(fsm, mil=10)
+        assert s1 == ZoneState.ELEVATED, "First surge reading must not escalate to SURGE"
+        # Second reading
+        s2 = self._eval(fsm, mil=10)
+        assert s2 == ZoneState.SURGE
+
+    # ── ELEVATED → NORMAL (immediate de-escalation) ──────────────────────────
+
+    def test_elevated_to_normal_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, mil=6); self._eval(fsm, mil=6)
+        assert fsm.state == ZoneState.ELEVATED
+        state = self._eval(fsm, mil=0)   # clear all triggers
+        assert state == ZoneState.NORMAL
+
+    # ── ELEVATED → EMERGENCY (immediate) ─────────────────────────────────────
+
+    def test_elevated_to_emergency_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, mil=6); self._eval(fsm, mil=6)
+        state = self._eval(fsm, squawk=True)
+        assert state == ZoneState.EMERGENCY
+
+    # ── ELEVATED → EVACUATING (immediate) ────────────────────────────────────
+
+    def test_elevated_to_evacuating_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, mil=6); self._eval(fsm, mil=6)
+        state = self._eval(fsm, evac=3)
+        assert state == ZoneState.EVACUATING
+
+    # ── SURGE → ELEVATED (immediate de-escalation) ───────────────────────────
+
+    def test_surge_to_elevated_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        # Reach SURGE
+        self._eval(fsm, mil=6);  self._eval(fsm, mil=6)   # ELEVATED
+        self._eval(fsm, mil=10); self._eval(fsm, mil=10)  # SURGE
+        assert fsm.state == ZoneState.SURGE
+        # Drop to elevated band
+        state = self._eval(fsm, mil=7)
+        assert state == ZoneState.ELEVATED
+
+    # ── SURGE → NORMAL (immediate de-escalation) ─────────────────────────────
+
+    def test_surge_to_normal_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, mil=6);  self._eval(fsm, mil=6)
+        self._eval(fsm, mil=10); self._eval(fsm, mil=10)
+        assert fsm.state == ZoneState.SURGE
+        state = self._eval(fsm, mil=0)
+        assert state == ZoneState.NORMAL
+
+    # ── SURGE → EMERGENCY (immediate) ────────────────────────────────────────
+
+    def test_surge_to_emergency_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, mil=6);  self._eval(fsm, mil=6)
+        self._eval(fsm, mil=10); self._eval(fsm, mil=10)
+        state = self._eval(fsm, squawk=True, mil=10)
+        assert state == ZoneState.EMERGENCY
+
+    # ── EMERGENCY → NORMAL (immediate de-escalation) ─────────────────────────
+
+    def test_emergency_to_normal_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, squawk=True)
+        assert fsm.state == ZoneState.EMERGENCY
+        state = self._eval(fsm, mil=0)
+        assert state == ZoneState.NORMAL
+
+    # ── EMERGENCY → ELEVATED (immediate de-escalation) ───────────────────────
+
+    def test_emergency_to_elevated_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, squawk=True)
+        # Squawk gone but elevated military count — should land in ELEVATED
+        # immediately (de-escalation from EMERGENCY severity-8 to ELEVATED severity-3)
+        state = self._eval(fsm, mil=6)
+        assert state == ZoneState.ELEVATED
+
+    # ── EMERGENCY → SURGE (immediate de-escalation) ──────────────────────────
+
+    def test_emergency_to_surge_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, squawk=True)
+        # Squawk gone, surge-level military count: SURGE < EMERGENCY severity
+        state = self._eval(fsm, mil=10)
+        assert state == ZoneState.SURGE, \
+            "EMERGENCY→SURGE is de-escalation (sev 8→6), must be immediate"
+
+    # ── EVACUATING → NORMAL (immediate de-escalation) ────────────────────────
+
+    def test_evacuating_to_normal_is_immediate(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, evac=3)
+        assert fsm.state == ZoneState.EVACUATING
+        state = self._eval(fsm, evac=0)
+        assert state == ZoneState.NORMAL
+
+    # ── EVACUATING → SURGE (2 readings — escalation) ─────────────────────────
+
+    def test_evacuating_to_surge_is_immediate_lateral_move(self):
+        """
+        EVACUATING and SURGE both have severity 6 — lateral move, applies immediately.
+        Evac callsigns gone but surge-level military count appears.
+        """
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        self._eval(fsm, evac=3)
+        assert fsm.state == ZoneState.EVACUATING
+        # evac condition clears, surge-level aircraft appear — lateral (sev 6→6)
+        state = self._eval(fsm, evac=0, mil=10)
+        assert state == ZoneState.SURGE
+
+    # ── Invalid transition rejection ─────────────────────────────────────────
+
+    def test_invalid_transition_is_ignored(self):
+        """NORMAL cannot jump directly to SURGE — not in _ZONE_TRANSITIONS."""
+        from data.feeds.aviation_client import ZoneState
+        fsm    = self._fsm()
+        result = fsm.transition(ZoneState.SURGE)
+        assert result      is False
+        assert fsm.state   == ZoneState.NORMAL
+
+    def test_self_transition_is_noop(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm    = self._fsm()
+        result = fsm.transition(ZoneState.NORMAL)
+        assert result      is False
+        assert fsm.state   == ZoneState.NORMAL
+
+    # ── Severity property ─────────────────────────────────────────────────────
+
+    def test_severity_increases_with_state(self):
+        from data.feeds.aviation_client import ZoneState, _STATE_SEVERITY
+        # Strict ordering: NORMAL < ELEVATED < SURGE == EVACUATING < EMERGENCY
+        assert _STATE_SEVERITY[ZoneState.NORMAL]     < _STATE_SEVERITY[ZoneState.ELEVATED]
+        assert _STATE_SEVERITY[ZoneState.ELEVATED]   < _STATE_SEVERITY[ZoneState.SURGE]
+        assert _STATE_SEVERITY[ZoneState.SURGE]      < _STATE_SEVERITY[ZoneState.EMERGENCY]
+
+    def test_severity_matches_state(self):
+        from data.feeds.aviation_client import ZoneState
+        fsm = self._fsm()
+        assert fsm.severity == 0
+        self._eval(fsm, squawk=True)
+        assert fsm.severity == 8
+
+    # ── reset() ───────────────────────────────────────────────────────────────
+
+    def test_reset_returns_to_normal_from_any_state(self):
+        from data.feeds.aviation_client import ZoneState
+        for setup in [
+            lambda f: (self._eval(f, squawk=True),),
+            lambda f: (self._eval(f, evac=3),),
+            lambda f: (self._eval(f, mil=6), self._eval(f, mil=6)),
+        ]:
+            fsm = self._fsm()
+            setup(fsm)
+            fsm.reset()
+            assert fsm.state    == ZoneState.NORMAL
+            assert fsm._pending is None
+
+    # ── All valid transitions are reachable ───────────────────────────────────
+
+    def test_all_zone_states_reachable(self):
+        """Every ZoneState must be reachable via evaluate() from NORMAL."""
+        from data.feeds.aviation_client import ZoneState
+        reached = set()
+
+        # NORMAL
+        fsm = self._fsm()
+        reached.add(fsm.state)
+
+        # ELEVATED
+        self._eval(fsm, mil=6); self._eval(fsm, mil=6)
+        reached.add(fsm.state)
+
+        # SURGE
+        self._eval(fsm, mil=10); self._eval(fsm, mil=10)
+        reached.add(fsm.state)
+
+        # EMERGENCY
+        self._eval(fsm, squawk=True)
+        reached.add(fsm.state)
+
+        # EVACUATING
+        fsm2 = self._fsm()
+        self._eval(fsm2, evac=3)
+        reached.add(fsm2.state)
+
+        assert reached == set(ZoneState), f"Unreachable states: {set(ZoneState) - reached}"
+
+    # ── Transition table completeness ─────────────────────────────────────────
+
+    def test_transition_table_covers_all_states(self):
+        from data.feeds.aviation_client import ZoneState, _ZONE_TRANSITIONS
+        assert set(_ZONE_TRANSITIONS.keys()) == set(ZoneState), \
+            "Every ZoneState must have an entry in _ZONE_TRANSITIONS"
+
+    def test_no_self_loops_in_transition_table(self):
+        from data.feeds.aviation_client import ZoneState, _ZONE_TRANSITIONS
+        for state, targets in _ZONE_TRANSITIONS.items():
+            assert state not in targets, \
+                f"State {state} has a self-loop in _ZONE_TRANSITIONS"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aviation anomaly detection (unit — no network)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAviationAnomalyDetection:
+    """Tests detect_aviation_anomalies() and score_aviation() with synthetic data."""
+
+    def _make_state(self, zone, callsign="", squawk="", on_ground=False):
+        return {
+            "icao24":          "abc123",
+            "callsign":        callsign,
+            "origin_country":  "United States",
+            "longitude":       35.0,
+            "latitude":        32.0,
+            "baro_altitude":   10000.0,
+            "on_ground":       on_ground,
+            "velocity":        250.0,
+            "squawk":          squawk,
+            "zone":            zone,
+            "zone_description": "Test zone",
+            "zone_domains":    ["commodities"],
+        }
+
+    def setup_method(self):
+        # Reset module-level FSMs between tests
+        from data.feeds import aviation_client
+        aviation_client._zone_fsms.clear()
+
+    def test_empty_states_returns_no_anomalies(self):
+        from data.feeds.aviation_client import detect_aviation_anomalies
+        assert detect_aviation_anomalies([]) == []
+
+    def test_emergency_squawk_triggers_anomaly(self):
+        from data.feeds.aviation_client import detect_aviation_anomalies
+        states = [self._make_state("levant_corridor", squawk="7700")]
+        # Emergency is immediate — single reading
+        result = detect_aviation_anomalies(states)
+        assert len(result) == 1
+        assert result[0]["anomaly_type"] == "emergency_squawk"
+        assert result[0]["severity_int"] == 8
+
+    def test_mass_evac_triggers_anomaly(self):
+        from data.feeds.aviation_client import detect_aviation_anomalies
+        states = [
+            self._make_state("eastern_europe_front", callsign="EVAC01"),
+            self._make_state("eastern_europe_front", callsign="EVAC02"),
+            self._make_state("eastern_europe_front", callsign="EVAC03"),
+        ]
+        result = detect_aviation_anomalies(states)
+        assert any(a["anomaly_type"] == "mass_evacuation" for a in result)
+
+    def test_military_surge_escalation_path(self):
+        """
+        NORMAL → SURGE requires four readings: 2 to reach ELEVATED, 2 more to SURGE.
+        SURGE is not reachable directly from NORMAL (not in _ZONE_TRANSITIONS[NORMAL]).
+        evaluate() clamps the target to ELEVATED when SURGE is not a valid next state.
+        """
+        from data.feeds.aviation_client import detect_aviation_anomalies, ZoneState
+        from data.feeds import aviation_client
+        zone = "levant_corridor"  # baseline=3, surge=3*2.5=7.5 → need ≥8
+        mil_states = [
+            self._make_state(zone, callsign=f"RCH{i:02d}")
+            for i in range(9)
+        ]
+
+        # Reads 1: pending=ELEVATED (clamped from SURGE, NORMAL→SURGE invalid), no anomaly
+        r1 = detect_aviation_anomalies(mil_states)
+        assert not r1, f"Read 1: expected no anomaly, got {r1}"
+        assert aviation_client._zone_fsms[zone].state == ZoneState.NORMAL
+
+        # Read 2: ELEVATED confirmed — anomaly_type=military_surge (elevated branch)
+        r2 = detect_aviation_anomalies(mil_states)
+        assert aviation_client._zone_fsms[zone].state == ZoneState.ELEVATED
+        elev_hit = [a for a in r2 if a["zone"] == zone]
+        assert elev_hit, "Read 2: expected elevated military_surge anomaly"
+
+        # Read 3: from ELEVATED, target=SURGE (valid), pending=SURGE — still ELEVATED
+        r3 = detect_aviation_anomalies(mil_states)
+        assert aviation_client._zone_fsms[zone].state == ZoneState.ELEVATED
+
+        # Read 4: SURGE confirmed
+        r4 = detect_aviation_anomalies(mil_states)
+        assert aviation_client._zone_fsms[zone].state == ZoneState.SURGE
+        surge_hit = [a for a in r4 if a["anomaly_type"] == "military_surge"
+                     and a["zone"] == zone]
+        assert surge_hit, "Read 4: expected confirmed SURGE anomaly"
+
+    def test_normal_activity_produces_no_anomaly(self):
+        from data.feeds.aviation_client import detect_aviation_anomalies
+        # 1 commercial aircraft with no military callsign, no squawk
+        states = [self._make_state("taiwan_strait_airspace", callsign="UAL123")]
+        r1 = detect_aviation_anomalies(states)
+        r2 = detect_aviation_anomalies(states)
+        assert r1 == []
+        assert r2 == []
+
+    def test_score_zero_when_no_states(self):
+        from data.feeds.aviation_client import score_aviation
+        assert score_aviation([]) == 0.0
+
+    def test_score_positive_on_emergency(self):
+        from data.feeds.aviation_client import score_aviation
+        # Provide two readings so FSM confirms (emergency is immediate)
+        states = [self._make_state("levant_corridor", squawk="7700")]
+        s = score_aviation(states)
+        assert s > 0.0
+
+    def test_score_bounded_0_100(self):
+        from data.feeds.aviation_client import score_aviation
+        # Flood every zone with emergency squawks
+        from data.feeds.aviation_client import AVIATION_ZONES
+        states = []
+        for zone in AVIATION_ZONES:
+            for _ in range(5):
+                states.append(self._make_state(zone, squawk="7700"))
+        s = score_aviation(states)
+        assert 0.0 <= s <= 100.0
+
+    def test_anomaly_dict_has_required_keys(self):
+        from data.feeds.aviation_client import detect_aviation_anomalies
+        states = [self._make_state("levant_corridor", squawk="7700")]
+        result = detect_aviation_anomalies(states)
+        assert result, "Expected at least one anomaly"
+        for key in ("zone", "anomaly_type", "severity_int", "domains",
+                    "aircraft_count", "description"):
+            assert key in result[0], f"Missing key '{key}' in anomaly dict"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Aviation → OSINTEvent pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProcessAviation:
+
+    def test_process_aviation_returns_osint_events(self):
+        from data.feeds.osint_processor import process_aviation, OSINTEvent
+        anomalies = [{
+            "zone":           "levant_corridor",
+            "anomaly_type":   "military_surge",
+            "severity_int":   6,
+            "domains":        ["commodities"],
+            "aircraft_count": 9,
+            "baseline":       3,
+            "details":        ["RCH001", "RCH002"],
+            "description":    "Test surge",
+        }]
+        events = process_aviation(anomalies)
+        assert len(events) == 1
+        assert isinstance(events[0], OSINTEvent)
+
+    def test_process_aviation_event_type_is_military_aviation(self):
+        from data.feeds.osint_processor import process_aviation
+        anomalies = [{
+            "zone":           "persian_gulf_approaches",
+            "anomaly_type":   "emergency_squawk",
+            "severity_int":   8,
+            "domains":        ["commodities"],
+            "aircraft_count": 1,
+            "baseline":       0,
+            "details":        ["7700"],
+            "description":    "Test emergency",
+        }]
+        events = process_aviation(anomalies)
+        assert events[0].event_type == "military_aviation"
+
+    def test_process_aviation_escalation_trajectory(self):
+        from data.feeds.osint_processor import process_aviation
+        for anom_type, expected_traj in [
+            ("military_surge",   "escalating"),
+            ("mass_evacuation",  "escalating"),
+            ("vip_movement",     "stable"),
+        ]:
+            anomalies = [{
+                "zone": "test", "anomaly_type": anom_type,
+                "severity_int": 4, "domains": ["commodities"],
+                "aircraft_count": 1, "baseline": 0,
+                "details": [], "description": "",
+            }]
+            evs = process_aviation(anomalies)
+            assert evs[0].escalation_trajectory == expected_traj, \
+                f"{anom_type} should be {expected_traj}"
+
+    def test_process_aviation_confidence_is_high(self):
+        from data.feeds.osint_processor import process_aviation
+        events = process_aviation([{
+            "zone": "x", "anomaly_type": "isr_activity",
+            "severity_int": 4, "domains": ["us_equities"],
+            "aircraft_count": 1, "baseline": 0,
+            "details": ["POLO01"], "description": "ISR detected",
+        }])
+        assert events[0].confidence >= 0.7, "ADS-B data is high quality — confidence must be ≥0.7"
+
+    def test_process_aviation_empty_input(self):
+        from data.feeds.osint_processor import process_aviation
+        assert process_aviation([]) == []
+
+    def test_military_aviation_is_valid_event_type(self):
+        from data.feeds.osint_processor import VALID_EVENT_TYPES
+        assert "military_aviation" in VALID_EVENT_TYPES
+
+    def test_corporate_intelligence_is_valid_event_type(self):
+        from data.feeds.osint_processor import VALID_EVENT_TYPES
+        assert "corporate_intelligence" in VALID_EVENT_TYPES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Company researcher — keyword extraction and scoring (no network)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCompanyResearcher:
+
+    def test_keyword_extract_ticker_symbol(self):
+        from data.feeds.company_researcher import _extract_companies_keyword
+        tickers = _extract_companies_keyword(
+            "RTX and LMT both won new Pentagon contracts this quarter"
+        )
+        assert "RTX" in tickers
+        assert "LMT" in tickers
+
+    def test_keyword_extract_company_name(self):
+        from data.feeds.company_researcher import _extract_companies_keyword
+        tickers = _extract_companies_keyword(
+            "Raytheon Technologies supplied new radar systems to NATO allies"
+        )
+        assert "RTX" in tickers
+
+    def test_keyword_extract_no_match_returns_empty(self):
+        from data.feeds.company_researcher import _extract_companies_keyword
+        tickers = _extract_companies_keyword("The quick brown fox jumps")
+        assert tickers == []
+
+    def test_keyword_extract_deduplicates(self):
+        from data.feeds.company_researcher import _extract_companies_keyword
+        # "Raytheon" and "RTX" refer to the same company
+        tickers = _extract_companies_keyword(
+            "Raytheon RTX reported strong earnings driven by Raytheon guidance"
+        )
+        assert tickers.count("RTX") == 1
+
+    def test_score_empty_profiles_is_zero(self):
+        from data.feeds.company_researcher import score_company_intel
+        assert score_company_intel([]) == 0.0
+
+    def test_score_increases_with_risk_level(self):
+        from data.feeds.company_researcher import (
+            score_company_intel, CompanyRiskProfile
+        )
+        low  = score_company_intel([CompanyRiskProfile(
+            company_name="TestCo", ticker="TST",
+            risk_level="low", exposure_type="conflict_party", confidence=1.0)])
+        high = score_company_intel([CompanyRiskProfile(
+            company_name="TestCo", ticker="TST",
+            risk_level="high", exposure_type="conflict_party", confidence=1.0)])
+        assert high > low
+
+    def test_score_increases_with_exposure_weight(self):
+        from data.feeds.company_researcher import (
+            score_company_intel, CompanyRiskProfile
+        )
+        investor = score_company_intel([CompanyRiskProfile(
+            company_name="X", ticker="X",
+            risk_level="high", exposure_type="investor", confidence=1.0)])
+        supplier = score_company_intel([CompanyRiskProfile(
+            company_name="X", ticker="X",
+            risk_level="high", exposure_type="supplier", confidence=1.0)])
+        assert supplier > investor
+
+    def test_score_bounded_100(self):
+        from data.feeds.company_researcher import (
+            score_company_intel, CompanyRiskProfile
+        )
+        profiles = [
+            CompanyRiskProfile(
+                company_name=f"Co{i}", ticker=f"C{i}",
+                risk_level="critical", exposure_type="conflict_party",
+                confidence=1.0)
+            for i in range(20)
+        ]
+        assert score_company_intel(profiles) <= 100.0
+
+    def test_risk_profile_defaults_are_valid(self):
+        from data.feeds.company_researcher import CompanyRiskProfile, RISK_LEVELS
+        p = CompanyRiskProfile(company_name="ACME", ticker="ACM")
+        assert p.risk_level    in RISK_LEVELS
+        assert p.exposure_type in ("low", "moderate", "high", "critical",
+                                   "supplier", "customer", "regulator",
+                                   "conflict_party", "investor", "unknown")
+
+    def test_invalid_risk_level_coerced(self):
+        from data.feeds.company_researcher import CompanyRiskProfile, RISK_LEVELS
+        p = CompanyRiskProfile(company_name="X", ticker="X",
+                               risk_level="catastrophic")
+        assert p.risk_level in RISK_LEVELS
+
+    def test_process_company_research_empty_profiles(self):
+        from data.feeds.osint_processor import process_company_research
+        assert process_company_research([]) == []
+
+    def test_process_company_research_returns_events(self):
+        from data.feeds.company_researcher import CompanyRiskProfile
+        from data.feeds.osint_processor import process_company_research, OSINTEvent
+        profiles = [CompanyRiskProfile(
+            company_name="Raytheon Technologies", ticker="RTX",
+            risk_level="high", exposure_type="conflict_party",
+            summary="RTX won $2B Pentagon contract", confidence=0.8,
+            domains_at_risk=["us_equities"],
+        )]
+        events = process_company_research(profiles)
+        assert len(events) == 1
+        assert isinstance(events[0], OSINTEvent)
+        assert events[0].event_type == "corporate_intelligence"
+        assert events[0].source     == "company_intel"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Updated OSINT weights — 8 sources
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOSINTWeights8Sources:
+
+    def test_all_eight_sources_sum_to_1(self):
+        from data.feeds.conflict_index import _OSINT_BASE_WEIGHTS
+        assert abs(sum(_OSINT_BASE_WEIGHTS.values()) - 1.0) < 1e-9
+
+    def test_aviation_and_company_intel_present(self):
+        from data.feeds.conflict_index import _OSINT_BASE_WEIGHTS
+        assert "aviation"      in _OSINT_BASE_WEIGHTS
+        assert "company_intel" in _OSINT_BASE_WEIGHTS
+
+    def test_aviation_weight_meaningful(self):
+        from data.feeds.conflict_index import _OSINT_BASE_WEIGHTS
+        assert _OSINT_BASE_WEIGHTS["aviation"] >= 0.08, \
+            "Aviation is an early-warning signal — weight must be ≥8%"
+
+    def test_redistribution_with_all_8_sources(self):
+        from data.feeds.conflict_index import _redistribute_weights, _OSINT_BASE_WEIGHTS
+        w = _redistribute_weights(set(_OSINT_BASE_WEIGHTS.keys()))
+        assert abs(sum(w.values()) - 1.0) < 1e-9
+
+    def test_redistribution_without_new_sources_still_sums_to_1(self):
+        """Legacy 6-source subsets must still redistribute correctly."""
+        from data.feeds.conflict_index import _redistribute_weights
+        w = _redistribute_weights({"gdelt", "edgar", "ucdp", "maritime", "firms", "usgs"})
+        assert abs(sum(w.values()) - 1.0) < 1e-9
+
+    def test_new_sources_excluded_when_unavailable(self):
+        """If aviation/company_intel fail, their weight is absorbed by others."""
+        from data.feeds.conflict_index import _redistribute_weights
+        w = _redistribute_weights({"gdelt", "edgar", "ucdp"})
+        assert "aviation"      not in w
+        assert "company_intel" not in w
+        assert abs(sum(w.values()) - 1.0) < 1e-9
+
+    def test_run_pipeline_accepts_new_kwargs(self):
+        """run_pipeline() must accept aviation_anomalies and company_profiles."""
+        from data.feeds.osint_processor import run_pipeline
+        result = run_pipeline(
+            aviation_anomalies = [],
+            company_profiles   = [],
+        )
+        assert result.source_scores["aviation"]      == 0.0
+        assert result.source_scores["company_intel"] == 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Plain-Python runner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1205,6 +1907,8 @@ def _run():
         TestMarketProxyScoring, TestGdeltScoring,
         TestCompositeWeights, TestConfig, TestIndicatorMath,
         TestFundingArbSignal, TestOrderFlowImbalance, TestFactorModel,
+        TestZoneAnomalyFSM, TestAviationAnomalyDetection,
+        TestProcessAviation, TestCompanyResearcher, TestOSINTWeights8Sources,
     ]
     p = f = sk = 0
     for cls in SUITES:

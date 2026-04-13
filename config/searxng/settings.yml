@@ -1,0 +1,74 @@
+# SearXNG settings for Arka Intelligence search
+# Mounted into /etc/searxng/settings.yml inside the container.
+#
+# Design choices:
+#   - limiter: false   — self-hosted, no need to rate-limit ourselves
+#   - formats: json    — osint clients query JSON only; HTML kept for debug UI
+#   - safe_search: 0   — financial/geopolitical research requires unrestricted results
+#   - time_range       — clients pass day/week; no default restriction
+#   - engines          — news-focused: DuckDuckGo, Bing News, Google News
+#                        General web for company research fallback.
+
+use_default_settings: true
+
+general:
+  instance_name: "Arka Intelligence"
+  privacypolicy_url: false
+  donation_url: false
+  contact_url: false
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en-US"
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  formats:
+    - html
+    - json
+
+server:
+  # Change this in production — any string works for self-hosted
+  secret_key: "arka-mara-searxng-key-change-in-prod"
+  limiter: false
+  image_proxy: false
+  method: "GET"
+
+ui:
+  static_use_hash: true
+  query_in_title: false
+  infinite_scroll: false
+  default_theme: simple
+  theme_args:
+    simple_style: auto
+
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
+  retries: 2
+
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    categories: general
+    shortcut: ddg
+
+  - name: duckduckgo news
+    engine: duckduckgo_news
+    categories: news
+    shortcut: ddn
+
+  - name: bing news
+    engine: bing_news
+    categories: news
+    shortcut: bn
+
+  - name: google news
+    engine: google_news
+    categories: news
+    shortcut: gn
+    disabled: false
