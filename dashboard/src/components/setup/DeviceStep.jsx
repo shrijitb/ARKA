@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { arkaFetch } from '../../utils/api.js';
 import { cn } from '../../utils/cn.js';
 
 const PROFILES = {
@@ -14,7 +15,7 @@ export default function DeviceStep({ onNext, onBack }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/system/hardware').then(r => r.ok ? r.json() : null)
+    arkaFetch('/system/hardware').then(r => r.ok ? r.json() : null)
       .then(d => { setHw(d); setLoading(false); }).catch(() => setLoading(false));
   }, []);
 

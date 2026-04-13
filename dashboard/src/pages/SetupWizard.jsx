@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { arkaFetch } from '../utils/api.js';
 import StepIndicator from '../components/setup/StepIndicator.jsx';
 import WelcomeStep   from '../components/setup/WelcomeStep.jsx';
 import DeviceStep    from '../components/setup/DeviceStep.jsx';
@@ -9,7 +10,7 @@ import ReviewStep    from '../components/setup/ReviewStep.jsx';
 
 async function postCreds(creds) {
   try {
-    const r = await fetch('/api/setup/credentials', {
+    const r = await arkaFetch('/setup/credentials', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(creds),
