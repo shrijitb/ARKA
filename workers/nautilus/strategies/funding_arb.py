@@ -68,6 +68,56 @@ ENTRY_THRESHOLD = 0.0001   # 0.01% per 8h — minimum carry to enter
 EXIT_THRESHOLD  = 0.00002  # 0.002% — near zero, close position
 SL_PCT          = 0.015    # 1.5% stop loss (tight — carry, not directional)
 TP_PCT          = 0.0075   # 0.75% take profit (half an 8h settlement proxy)
+RESERVE_PCT     = 0.15     # 15% reserve for delta-neutral arb
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Capital Allocation with Reserve
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_arb_allocation(
+    allocated_capital: float,
+    leverage: int = 3,
+    reserve_pct: float = RESERVE_PCT,
+) -> dict:
+    """
+    Split allocated capital into tradeable and reserve portions.
+
+    For a delta-neutral arb with leverage:
+        total_allocated = $100
+        reserve = $100 * 0.15 / 3 = $5.00
+        tradeable = $100 - $5.00 = $95.00
+        per_leg = $95.00 / 2 = $47.50
+        spot_leg_notional = $47.50
+        perp_leg_notional = $47.50
+
+    The reserve stays liquid in USDT to cover:
+        - Margin calls if basis widens unexpectedly
+        - Funding rate sign flips requiring position adjustment
+        - Temporary mark-to-market losses on one leg
+
+    Args:
+        allocated_capital: Total capital allocated to this arb position
+        leverage: Leverage multiplier for the perp leg
+        reserve_pct: Reserve percentage (default 15% for funding_arb)
+
+    Returns:
+        Dict with keys:
+            - reserve_usd: Amount to hold in reserve
+            - tradeable_usd: Amount available for trading
+            - spot_leg_usd: Notional for spot leg
+            - perp_leg_usd: Notional for perp leg
+    """
+    reserve = allocated_capital * reserve_pct / max(leverage, 1)
+    tradeable = allocated_capital - reserve
+    per_leg = tradeable / 2.0
+
+    return {
+        "reserve_usd": round(reserve, 2),
+        "tradeable_usd": round(tradeable, 2),
+        "spot_leg_usd": round(per_leg, 2),
+        "perp_leg_usd": round(per_leg, 2),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

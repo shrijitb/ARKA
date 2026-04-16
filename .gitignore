@@ -97,3 +97,20 @@ CLAUDE.md
 
 # Legacy one-shot patch scripts (already absorbed into source files)
 patch_*.py
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.gsd-id
+.bg-shell/
+*.code-workspace
+.env.*
+!.env.example
+node_modules/
+.next/
+*.pyc
+.venv/
+target/
+vendor/
+coverage/
+.cache/
+tmp/

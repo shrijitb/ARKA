@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+Arka CLI - Launch dashboard as popup or manage Arka installation
+Usage: arka [command]
+Commands:
+  launch          Launch dashboard popup
+  install         Run installation (alias for install.sh)
+  status          Show Arka status
+  logs            Show logs
+  stop            Stop Arka services
+  start           Start Arka services
+  restart         Restart Arka services
+"""
+
+import sys
+import os
+import subprocess
+import json
+import time
+import webbrowser
+from pathlib import Path
+from typing import Optional
+
+# Configuration
+ARKA_DIR = os.environ.get('ARKA_DIR', os.path.expanduser('~/arka'))
+DASHBOARD_URL = "http://localhost:3000"
+HYPERVISOR_URL = "http://localhost:8000"
+
+def run_cmd(cmd, capture_output=True, check=True):
+    """Run a command and return result"""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=capture_output,
+            text=True, check=check
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {cmd}")
+        print(f"Error: {e.stderr}")
+        return None
+
+def check_service_health(url: str, timeout: int = 5) -> bool:
+    """Check if a service is healthy"""
+    try:
+        import urllib.request
+        urllib.request.urlopen(url, timeout=timeout)
+        return True
+    except:
+        return False
+
+def get_hardware_profile() -> Optional[dict]:
+    """Get hardware profile from .hardware_profile.json"""
+    profile_file = Path(ARKA_DIR) / '.hardware_profile.json'
+    if profile_file.exists():
+        try:
+            with open(profile_file) as f:
+                return json.load(f)
+        except:
+            pass
+    return None
+
+def launch_dashboard_popup():
+    """Launch dashboard as popup window"""
+    print("🚀 Launching Arka Dashboard...")
+
+    # Check if Arka is running
+    if not check_service_health(HYPERVISOR_URL):
+        print("⚠️  Arka services not running. Starting services...")
+        start_services()
+
+        # Wait for services to be ready
+        print("⏳ Waiting for services to be ready...")
+        for i in range(30):
+            if check_service_health(HYPERVISOR_URL):
+                print("✅ Services are ready!")
+                break
+            time.sleep(2)
+        else:
+            print("❌ Services failed to start. Please check logs with: arka logs")
+            return False
+
+    # Launch dashboard
+    print(f"🌐 Opening dashboard at {DASHBOARD_URL}")
+    webbrowser.open(DASHBOARD_URL)
+
+    return True
+
+def start_services():
+    """Start Arka services"""
+    os.chdir(ARKA_DIR)
+    
+    # Check if docker-compose files exist
+    compose_files = ["docker-compose.yml", "docker-compose.profile.yml"]
+    if not all(Path(f).exists() for f in compose_files):
+        print("❌ Docker compose files not found. Please run 'arka install' first.")
+        return False
+    
+    print("🚀 Starting Arka services...")
+    result = run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml up -d")
+    if result is None:
+        return False
+    
+    print("✅ Services started")
+    return True
+
+def stop_services():
+    """Stop Arka services"""
+    os.chdir(ARKA_DIR)
+    print("🛑 Stopping Arka services...")
+    result = run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml down")
+    if result is None:
+        return False
+    print("✅ Services stopped")
+    return True
+
+def show_status():
+    """Show Arka status"""
+    print("📊 Arka Status")
+    print("=" * 50)
+
+    # Check hardware profile
+    profile = get_hardware_profile()
+    if profile:
+        print(f"Hardware Profile: {profile.get('board', 'unknown')} ({profile.get('arch', 'unknown')})")
+        print(f"CPU: {profile.get('cpu_model', 'unknown')} ({profile.get('cpu_cores', '?')} cores)")
+        print(f"RAM: {profile.get('ram_mb', 0)}MB")
+        print(f"GPU: {profile.get('gpu', 'none')}")
+    else:
+        print("Hardware Profile: Not detected")
+
+    print()
+
+    # Check services
+    services = [
+        ("Hypervisor", HYPERVISOR_URL),
+        ("Dashboard", DASHBOARD_URL),
+    ]
+    
+    for name, url in services:
+        status = "✅ Running" if check_service_health(url) else "❌ Stopped"
+        print(f"{name:12}: {status}")
+    
+    # Check Docker containers
+    print()
+    print("🐳 Docker Containers:")
+    result = run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml ps --format 'table {{.Name}}\\t{{.Status}}\\t{{.Ports}}'", capture_output=True, check=False)
+    if result:
+        print(result.stdout)
+
+def show_logs():
+    """Show Arka logs"""
+    os.chdir(ARKA_DIR)
+    print("📋 Arka Logs (last 100 lines)")
+    print("=" * 50)
+    run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml logs --tail=100")
+
+def install_arka():
+    """Run Arka installation"""
+    print("📦 Installing Arka...")
+    
+    # Download and run install script
+    install_script = Path(ARKA_DIR) / "install.sh"
+    
+    if not install_script.exists():
+        print("❌ install.sh not found. Please download Arka first.")
+        return False
+    
+    os.chdir(ARKA_DIR)
+    result = run_cmd("bash install.sh")
+    if result is None:
+        return False
+    
+    print("✅ Installation completed!")
+    return True
+
+def main():
+    """Main CLI entry point"""
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return
+    
+    command = sys.argv[1].lower()
+    
+    if command == "launch":
+        launch_dashboard_popup()
+    elif command == "install":
+        install_arka()
+    elif command == "status":
+        show_status()
+    elif command == "logs":
+        show_logs()
+    elif command == "stop":
+        stop_services()
+    elif command == "start":
+        start_services()
+    elif command == "restart":
+        stop_services()
+        time.sleep(2)
+        start_services()
+    else:
+        print(f"Unknown command: {command}")
+        print(__doc__)
+
+if __name__ == "__main__":
+    main()

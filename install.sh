@@ -324,6 +324,128 @@ if ! curl -sf http://localhost:8000/health > /dev/null 2>&1; then
     warn "Check logs: docker compose logs hypervisor"
 fi
 
+# ── Phase 9: Setup CLI ────────────────────────────────────────────
+
+step "Setting up Arka CLI"
+
+# Copy the arka-cli to a location in PATH
+CLI_SRC="$ARKA_DIR/arka-cli"
+CLI_DEST="/usr/local/bin/arka"
+
+if [ -f "$CLI_SRC" ]; then
+    if [ -w "/usr/local/bin" ] || [ "$(id -u)" -eq 0 ]; then
+        cp "$CLI_SRC" "$CLI_DEST" 2>/dev/null && chmod +x "$CLI_DEST" && ok "CLI installed to $CLI_DEST" || warn "Could not install CLI to $CLI_DEST (permission denied)"
+    else
+        warn "Cannot install to $CLI_DEST (permission denied)."
+        warn "To install CLI manually:"
+        warn "  sudo cp $CLI_SRC /usr/local/bin/arka && sudo chmod +x /usr/local/bin/arka"
+        warn "Or add $ARKA_DIR to your PATH:"
+        warn "  echo 'export PATH=\$PATH:$ARKA_DIR' >> ~/.bashrc"
+    fi
+else
+    warn "arka-cli not found at $CLI_SRC"
+fi
+
+# ── Phase 10: Launch Prompt ───────────────────────────────────────
+
+# Dashboard URL
+DASHBOARD_URL="http://localhost:3000"
+
+# Function to detect OS and open URL
+open_dashboard() {
+    local os_name
+    os_name=$(uname -s)
+    
+    case "$os_name" in
+        Darwin)
+            open "$DASHBOARD_URL" 2>/dev/null || true
+            ;;
+        Linux)
+            # Try common Linux browsers/openers
+            if command -v xdg-open &>/dev/null; then
+                xdg-open "$DASHBOARD_URL" 2>/dev/null || true
+            elif command -v gnome-open &>/dev/null; then
+                gnome-open "$DASHBOARD_URL" 2>/dev/null || true
+            elif command -v kde-open &>/dev/null; then
+                kde-open "$DASHBOARD_URL" 2>/dev/null || true
+            elif command -v chromium-browser &>/dev/null; then
+                chromium-browser "$DASHBOARD_URL" &>/dev/null &
+            elif command -v google-chrome &>/dev/null; then
+                google-chrome "$DASHBOARD_URL" &>/dev/null &
+            elif command -v firefox &>/dev/null; then
+                firefox "$DASHBOARD_URL" &>/dev/null &
+            fi
+            ;;
+        MINGW*|CYGWIN*|MSYS*)
+            start "$DASHBOARD_URL" 2>/dev/null || true
+            ;;
+    esac
+}
+
+# Function to show GUI dialog and launch
+show_launch_dialog() {
+    local os_name
+    os_name=$(uname -s)
+    local response=""
+    
+    case "$os_name" in
+        Darwin)
+            # Use AppleScript for macOS
+            response=$(osascript -e '
+                display dialog "Arka installation is complete!\n\nWould you like to open the dashboard now?" \
+                    buttons {"Later", "Launch Now"} \
+                    default button "Launch Now" \
+                    with icon note
+                button returned of result
+            ' 2>/dev/null || echo "")
+            if [ "$response" = "Launch Now" ]; then
+                open_dashboard
+            fi
+            ;;
+        Linux)
+            # Try zenity for GUI dialog
+            if command -v zenity &>/dev/null; then
+                if zenity --question --title="Arka Setup" --text="Arka installation is complete!\n\nWould you like to open the dashboard now?" 2>/dev/null; then
+                    open_dashboard
+                fi
+            # Try kdialog for KDE
+            elif command -v kdialog &>/dev/null; then
+                if kdialog --yesno "Arka installation is complete!\n\nWould you like to open the dashboard now?" --title "Arka Setup" 2>/dev/null; then
+                    open_dashboard
+                fi
+            else
+                # Fallback to terminal prompt
+                echo ""
+                echo "🚀 Arka is running!"
+                echo ""
+                read -p "📺 Open dashboard now? [Y/n] " -n 1 -r
+                echo ""
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    open_dashboard
+                fi
+            fi
+            ;;
+        MINGW*|CYGWIN*|MSYS*)
+            # Use PowerShell for Windows
+            powershell.exe -Command "
+                \$result = MessageBox.Show('Arka installation is complete!\n\nWould you like to open the dashboard now?', 'Arka Setup', 'YesNo', 'Question')
+                if (\$result -eq 'Yes') { Start-Process 'http://localhost:3000' }
+            " 2>/dev/null || echo ""
+            ;;
+        *)
+            # Fallback for unknown OS
+            echo ""
+            echo "🚀 Arka is running!"
+            echo ""
+            read -p "📺 Open dashboard now? [Y/n] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                open_dashboard
+            fi
+            ;;
+    esac
+}
+
 # ── Done ──────────────────────────────────────────────────────────
 
 echo ""
@@ -333,9 +455,14 @@ echo ""
 echo "  Dashboard:   http://localhost:3000               "
 echo "  API:         http://localhost:8000/status        "
 echo ""
-echo "  Open the dashboard to complete setup.            "
-echo "  The wizard will guide you through connecting     "
-echo "  your exchange and data feeds.                    "
+echo "  Commands:                                        "
+echo "    arka launch    - Open dashboard popup          "
+echo "    arka status    - Check system status           "
+echo "    arka logs      - View service logs             "
+echo "    arka stop      - Stop all services              "
 echo ""
-echo "  Logs:  docker compose -f $ARKA_DIR/docker-compose.yml logs -f"
+echo "  The dashboard will guide you through setup.      "
 echo "═══════════════════════════════════════════════════"
+
+# Show launch dialog (GUI or terminal-based)
+show_launch_dialog

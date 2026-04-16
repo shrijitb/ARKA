@@ -1,14 +1,36 @@
-# MARA: Multi-Agent Risk-Adjusted Capital Orchestrator
+# ARKA: Agentic Risk Killing Algorithms
 
-An open-source, autonomous trading system for turbulent macro environments. MARA coordinates specialized AI agents across crypto, futures, commodities, and prediction markets using dynamic regime-aware capital allocation.
+An open-source, autonomous trading system for turbulent macro environments. ARKA coordinates specialized agents and automations across crypto, futures, commodities, and prediction markets using dynamic regime-aware capital allocation.
 
-**Status**: Paper trading active (April 2026) | WAR_PREMIUM regime, 80% confidence | **License**: LGPL-3.0
-
-> **Branch: `arka-build-alpha`** — Arka dashboard, OSINT conflict index v2, Bayesian backtest optimizer, SearXNG integration, and modular worker refactor. Assisted by Claude (Anthropic) for organisation and modularity.
-
+**Status**: In development | **License**: LGPL-3.0
 ---
 
 ## Quick Start
+
+### One-Line Install (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shrijitb/MARA/arka-build-alpha/install.sh | bash
+```
+
+The installer will:
+- Check and install dependencies (Docker, git, jq)
+- Clone the repository
+- Detect your hardware (Pi, laptop, desktop)
+- Select the optimal LLM model and settings
+- Generate `.env` with your hardware profile
+- Build and launch the entire stack
+- **Show a popup dialog asking if you want to launch the dashboard now**
+- **Install the `arka` CLI command for easy management**
+
+After installation, you can:
+- **Launch dashboard popup**: `arka launch`
+- **Check system status**: `arka status`
+- **View logs**: `arka logs`
+- **Stop services**: `arka stop`
+- **Start services**: `arka start`
+
+### Manual Install
 
 ```bash
 git clone https://github.com/shrijitb/mara
@@ -22,6 +44,20 @@ docker compose up -d
 - **Hypervisor API**: `curl -s http://localhost:8000/status | python3 -m json.tool`
 
 → Full setup per OS (Windows 11 / Ubuntu 24.04 / macOS): [Setup](#setup)
+
+### CLI Commands
+
+After installation, you can manage Arka using the `arka` command:
+
+```bash
+arka launch          # Open dashboard popup in browser
+arka status          # Check system status and worker health
+arka logs            # View service logs (last 100 lines)
+arka stop            # Stop all services
+arka start           # Start all services
+arka restart         # Restart all services
+arka install         # Run installation (alias for install.sh)
+```
 
 ---
 
@@ -55,7 +91,7 @@ docker compose up -d
 
 ## Project Overview
 
-MARA targets **futures, crypto, forex, ETFs, and prediction markets** in regime-driven trading. The system operates in sequence: **backtest → paper trading (current) → live**.
+Arka targets **futures, crypto, forex, ETFs, and prediction markets** in regime-driven trading.
 
 ### Core Design
 
@@ -87,9 +123,9 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
 ## Architecture
 
 ```
-                        ┌─────────────────────────────┐
-                        │  Hypervisor (port 8000)     │
-                        │  FastAPI orchestrator       │
+                        ┌────────────────────────────┐
+                        │  Hypervisor (port 8000)    │
+                        │  FastAPI orchestrator      │
                         │  ┌──────────────────────┐  │
                         │  │  Regime Classifier   │  │
                         │  │  Conflict Index      │  │
@@ -109,7 +145,7 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
 ┌──────────────┐  ┌────────────┐  ┌─────────────────────┐
 │ telegram-bot │  │   ollama   │  │       analyst       │
 │  polling,    │  │ port 11434 │  │      port 8003      │
-│   no port    │  │ phi3:mini  │  │ phi3:mini + searxng  │
+│   no port    │  │ phi3:mini  │  │ phi3:mini + searxng │
 └──────────────┘  └────────────┘  └─────────────────────┘
 ```
 
@@ -131,21 +167,18 @@ Capital flows dynamically based on **7 market regimes** (WAR_PREMIUM, CRISIS_ACU
 
 ## Regime-Gated Capital Allocation
 
-The classifier outputs one of 7 regime labels. Capital is split across workers per profile, with a cash buffer enforced at all times. Weights normalise against the sum of all non-zero profile entries — not just healthy workers — so a single worker starting up cannot absorb more than its intended share.
+The classifier outputs one of **4 HMM states** using a Hidden Markov Model. Capital is split across workers per profile, with a cash buffer enforced at all times. Weights normalise against the sum of all non-zero profile entries — not just healthy workers — so a single worker starting up cannot absorb more than its intended share.
 
 | Regime | nautilus | prediction_markets | analyst | core_dividends | Max deploy |
 |--------|---------|-------------------|---------|----------------|-----------|
-| `WAR_PREMIUM` | 36% | 24% | 0% | 20% | 70% |
-| `CRISIS_ACUTE` | 40% | 20% | 0% | 0% | 50% |
-| `BEAR_RECESSION` | 36% | 16% | 8% | 20% | 75% |
-| `BULL_FROTHY` | 36% | 8% | 8% | 20% | 80% |
-| `REGIME_CHANGE` | 24% | 16% | 8% | 20% | 70% |
-| `SHADOW_DRIFT` | 28% | 12% | 8% | 20% | 75% |
-| `BULL_CALM` | 36% | 8% | 12% | 20% | 80% |
+| `RISK_ON` | 44% | 12% | 8% | 36% | 80% |
+| `RISK_OFF` | 34% | 18% | 8% | 40% | 75% |
+| `CRISIS` | 10% | 20% | 0% | 30% | 50% |
+| `TRANSITION` | 32% | 16% | 8% | 44% | 70% |
 
-Priority order (first match wins): `WAR_PREMIUM > CRISIS_ACUTE > BEAR_RECESSION > BULL_FROTHY > REGIME_CHANGE > SHADOW_DRIFT > BULL_CALM`
+Priority order (first match wins): `CRISIS > TRANSITION > RISK_OFF > RISK_ON`
 
-In `CRISIS_ACUTE`, 50%+ stays in cash by design — core_dividends gets 0%.
+In `CRISIS` state, 50% stays in cash by design.
 
 Sharpe penalty: if a worker's rolling Sharpe < 0.5, its allocation is halved. Fresh workers store `None` Sharpe (not `0.0`) to avoid false penalisation.
 
@@ -871,4 +904,4 @@ MARA is a research and development system. Past performance does not guarantee f
 
 ---
 
-**MARA v1.1 | April 2026 | LGPL-3.0**
+**ARKA v0.1 | April 2026 | LGPL-3.0**

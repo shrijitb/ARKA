@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "gsd-workflow": {
+      "command": "/usr/bin/node",
+      "args": [
+        "/home/shrijit/.npm-global/lib/node_modules/gsd-pi/packages/mcp-server/dist/cli.js"
+      ],
+      "cwd": "/home/shrijit/arka",
+      "env": {
+        "GSD_CLI_PATH": "/home/shrijit/.npm-global/bin/gsd",
+        "GSD_WORKFLOW_EXECUTORS_MODULE": "/home/shrijit/.gsd/agent/extensions/gsd/tools/workflow-tool-executors.js",
+        "GSD_WORKFLOW_WRITE_GATE_MODULE": "/home/shrijit/.gsd/agent/extensions/gsd/bootstrap/write-gate.js",
+        "GSD_PERSIST_WRITE_GATE_STATE": "1",
+        "GSD_WORKFLOW_PROJECT_ROOT": "/home/shrijit/arka"
+      }
+    }
+  }
+}
