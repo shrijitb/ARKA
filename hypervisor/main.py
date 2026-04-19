@@ -53,7 +53,8 @@ try:
 except ImportError:
     _APSCHEDULER_AVAILABLE = False
 
-from hypervisor.allocator.capital import RegimeAllocator
+from hypervisor.allocator.capital import HMM_STATE_LABELS, RegimeAllocator
+import numpy as np
 from hypervisor.audit import (
     audit,
     audit_allocation_update,
@@ -67,6 +68,7 @@ from hypervisor.audit import (
     audit_worker_paused,
     audit_worker_resumed,
     AuditEvent,
+    audit_log,
 )
 from hypervisor.auth import APIKeyMiddleware, get_or_create_api_key
 from hypervisor.circuit_breaker import BREAKERS, get_dependency_health
@@ -92,8 +94,9 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 INITIAL_CAPITAL_USD = float(os.environ.get("INITIAL_CAPITAL_USD", 200.0))
-CYCLE_INTERVAL_SEC  = int(os.environ.get("CYCLE_INTERVAL_SEC", 3600))
+CYCLE_INTERVAL_SEC  = int(os.environ.get("CYCLE_INTERVAL_SEC", 60))
 WORKER_TIMEOUT_SEC  = int(os.environ.get("WORKER_TIMEOUT_SEC", 10))
+PHASE3_ENABLED      = os.environ.get("PHASE3_ENABLED", "false").lower() == "true"
 MIN_TRADE_SIZE_USD  = float(os.environ.get("MIN_TRADE_SIZE_USD", 10.0))
 PAPER_TRADING       = os.environ.get("ARKA_LIVE", "false").lower() != "true"
 
@@ -129,7 +132,7 @@ class CredentialUpdate(BaseModel):
     value: str = Field(..., min_length=0, max_length=500)
 
 class WatchlistRequest(BaseModel):
-    ticker: str = Field(..., min_length=1, max_length=10)
+    ticker: str = Field(..., min_length=1, max_length=20, pattern=r'^[A-Z0-9.=\-/]{1,20}$')
 
 # ── Valid worker names (for input validation) ─────────────────────────────────
 VALID_WORKERS = frozenset({"nautilus", "prediction_markets", "analyst", "core_dividends"})
@@ -260,10 +263,8 @@ def _run_quarterly_sweep() -> None:
     """
     Fires on the 7th of Jan / Apr / Jul / Oct.
     Calculates surplus above INITIAL_CAPITAL_USD * 1.10, logs it, and
-    sends a Telegram alert.
-
-    # PHASE 3: wire OKX redemption — swap surplus USDT → fiat via OKX.
-    # PHASE 3: wire broker redemption — transfer surplus to bank account.
+    sends a Telegram alert.  When PHASE3_ENABLED=true, broker redemption
+    stubs are activated (OKX USDT → fiat, broker transfer).
     """
     target     = INITIAL_CAPITAL_USD * PROFIT_TARGET_MULTIPLIER
     surplus    = round(state.total_capital - target, 2)
@@ -272,13 +273,14 @@ def _run_quarterly_sweep() -> None:
     cycle      = state.cycle_count
 
     if surplus > 0:
+        _phase3_note = "\n\n_Redemption not yet wired — paper mode only._" if not PHASE3_ENABLED else ""
         msg = (
             f"📈 *Arka Quarterly Profit Sweep*\n"
             f"Total capital: ${total:.2f}\n"
             f"Target floor:  ${target:.2f} (initial × 1.10)\n"
             f"Surplus:       *${surplus:.2f}*\n"
-            f"Regime: `{regime}` | Cycles: {cycle}\n\n"
-            f"_PHASE 3: OKX/USDT redemption not yet wired._"
+            f"Regime: `{regime}` | Cycles: {cycle}"
+            f"{_phase3_note}"
         )
         logger.info(f"Quarterly sweep: surplus=${surplus:.2f} above ${target:.2f} floor")
     else:
@@ -293,11 +295,22 @@ def _run_quarterly_sweep() -> None:
         logger.info(f"Quarterly sweep: no surplus — ${shortfall:.2f} below target")
 
     _tg_send(msg)
+    audit_log.info(
+        AuditEvent.ALLOCATION_UPDATE,
+        sub_event="profit_sweep",
+        total_capital=total,
+        surplus=max(surplus, 0),
+        regime=regime,
+        cycle=cycle,
+    )
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Validate config before anything else — moved from import time (BUG-04)
+    validate_config()
+
     logger.info("=" * 60)
     logger.info("  ARKA HYPERVISOR STARTING")
     logger.info(f"  Capital  : ${INITIAL_CAPITAL_USD:.2f}")
@@ -357,11 +370,20 @@ app = FastAPI(title="Arka Hypervisor", version="2.0.0", lifespan=lifespan)
 _api_key = get_or_create_api_key()
 app.add_middleware(APIKeyMiddleware, api_key=_api_key)
 
+# CORS origins — default allows only the dashboard (port 3000) and Vite dev server (5173).
+# Override at deploy time via CORS_ALLOWED_ORIGINS (comma-separated list).
+_cors_origins_env = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+_cors_allowed_origins: List[str] = (
+    [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    if _cors_origins_env
+    else ["http://localhost:3000", "http://localhost:5173"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_allowed_origins,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -413,8 +435,6 @@ async def _run_cycle():
             result.circuit_breaker_active,
         )
         # Build numpy array from probabilities dict (order must match HMM_STATE_LABELS)
-        from hypervisor.allocator.capital import HMM_STATE_LABELS
-        import numpy as np
         regime_probs_array = np.array(
             [result.probabilities.get(lbl, 0.0) for lbl in HMM_STATE_LABELS],
             dtype=float,
@@ -422,6 +442,12 @@ async def _run_cycle():
         logger.info(
             f"  Regime: {state.current_regime} ({state.regime_confidence:.0%})"
             f"  CB={state.circuit_breaker_active}"
+        )
+        await audit_regime_change(
+            old_regime=snap["regime"],
+            new_regime=result.regime.value,
+            probabilities=result.probabilities,
+            circuit_breaker_active=result.circuit_breaker_active,
         )
     except RegimeClassificationError as exc:
         logger.error(f"Regime classification failed: {exc} — holding {state.current_regime}")
@@ -470,6 +496,11 @@ async def _run_cycle():
     )
     await state.update_allocations(alloc.allocations)
     logger.info(f"  {alloc.summary()}")
+    await audit_allocation_update(
+        allocations=alloc.allocations,
+        regime=snap["regime"],
+        total_capital=snap["total_capital"],
+    )
 
     # Step 6: Broadcast regime
     await _broadcast_regime(healthy, snap["regime"], snap["regime_confidence"])
@@ -484,7 +515,7 @@ async def _run_cycle():
     await repo.snapshot_portfolio(
         total_value=total,
         cash_pct=(total - deployed) / total if total > 0 else 1.0,
-        drawdown_pct=risk_mgr.summary(total, final_snap["free_capital"]).get("drawdown_pct", 0.0),
+        drawdown_pct=risk_mgr.get_drawdown_pct(total),
         regime=final_snap["regime"],
         allocations=final_snap["allocations"],
     )
@@ -519,28 +550,32 @@ async def _check_worker_health():
 
 
 async def _pull_worker_status(workers: List[str]):
+    """Poll all healthy workers /status concurrently (BUG-06 fix)."""
+
+    async def _fetch_one(client: httpx.AsyncClient, worker: str) -> None:
+        url = WORKER_REGISTRY.get(worker)
+        if not url:
+            return
+        try:
+            resp = await client.get(f"{url}/status")
+            if resp.status_code == 200:
+                data = resp.json()
+                async with state._lock:
+                    state.worker_status[worker] = data
+                pnl = float(data.get("pnl", 0.0))
+                await state.update_worker_pnl(worker, pnl)
+                # Use None when sharpe is 0.0 (no trade history yet).
+                # capital.py treats None as "no data" and skips the Sharpe gate,
+                # allowing fresh workers to receive allocations on first cycle.
+                _sharpe = float(data.get("sharpe", 0.0))
+                await state.update_worker_sharpe(worker, _sharpe if _sharpe != 0.0 else None)
+                async with state._lock:
+                    state.worker_allocated[worker] = float(data.get("allocated_usd", 0.0))
+        except Exception as exc:
+            logger.warning(f"  {worker} /status failed: {exc}")
+
     async with httpx.AsyncClient(timeout=WORKER_TIMEOUT_SEC) as client:
-        for worker in workers:
-            url = WORKER_REGISTRY.get(worker)
-            if not url:
-                continue
-            try:
-                resp = await client.get(f"{url}/status")
-                if resp.status_code == 200:
-                    data = resp.json()
-                    async with state._lock:
-                        state.worker_status[worker] = data
-                    pnl = float(data.get("pnl", 0.0))
-                    await state.update_worker_pnl(worker, pnl)
-                    # Use None when sharpe is 0.0 (no trade history yet).
-                    # capital.py treats None as "no data" and skips the Sharpe gate,
-                    # allowing fresh workers to receive allocations on first cycle.
-                    _sharpe = float(data.get("sharpe", 0.0))
-                    await state.update_worker_sharpe(worker, _sharpe if _sharpe != 0.0 else None)
-                    async with state._lock:
-                        state.worker_allocated[worker] = float(data.get("allocated_usd", 0.0))
-            except Exception as exc:
-                logger.warning(f"  {worker} /status failed: {exc}")
+        await asyncio.gather(*[_fetch_one(client, w) for w in workers])
 
 
 async def _broadcast_regime(workers: List[str], regime: str, confidence: float):
@@ -591,6 +626,7 @@ async def _pause_worker(worker: str):
             async with httpx.AsyncClient(timeout=WORKER_TIMEOUT_SEC) as client:
                 await client.post(f"{url}/pause")
             logger.info(f"  Paused: {worker}")
+            await audit_worker_paused(worker, reason="risk_limit")
         except Exception as exc:
             logger.warning(f"  {worker} /pause failed: {exc}")
 
@@ -601,6 +637,7 @@ async def _resume_worker(worker: str):
         try:
             async with httpx.AsyncClient(timeout=WORKER_TIMEOUT_SEC) as client:
                 await client.post(f"{url}/resume")
+            await audit_worker_resumed(worker)
         except Exception:
             pass
 
@@ -649,7 +686,7 @@ async def workers():
             "healthy":   snap["worker_health"].get(worker, False),
             "allocated": snap["allocations"].get(worker, 0.0),
             "pnl":       snap["worker_pnl"].get(worker, 0.0),
-            "sharpe":    snap["worker_sharpe"].get(worker, 0.0),
+            "sharpe":    snap["worker_sharpe"].get(worker) or 0.0,
         }
         for worker, url in WORKER_REGISTRY.items()
     }
@@ -743,10 +780,10 @@ async def get_watchlist():
 
 
 @app.post("/watchlist")
-async def add_to_watchlist(body: dict):
-    ticker = body.get("ticker", "").upper().strip()
-    if not ticker or not ticker.isalnum():
-        raise HTTPException(status_code=400, detail="ticker must be a non-empty alphanumeric string")
+async def add_to_watchlist(body: WatchlistRequest):
+    ticker = body.ticker.upper().strip()
+    if not re.match(r'^[A-Z0-9.=\-/]{1,20}$', ticker):
+        raise HTTPException(status_code=400, detail="ticker must be 1-20 chars of [A-Z0-9.=/-]")
     async with state._lock:
         if ticker not in state.watchlist:
             state.watchlist.append(ticker)
@@ -792,14 +829,28 @@ async def _check_ollama_health() -> bool:
 
 
 def _restart_container(service: str) -> None:
+    """Restart a sibling container via the Docker HTTP API.
+
+    In production the hypervisor talks to a scoped docker-socket-proxy
+    (DOCKER_PROXY_URL defaults to http://docker-proxy:2375) rather than
+    mounting /var/run/docker.sock directly.  This limits the blast radius to
+    only POST /containers/{id}/restart — no build, no exec, no image access.
+    """
     project = os.environ.get("COMPOSE_PROJECT_NAME", "arka")
     container = f"{project}-{service.replace('worker-', '')}"
+    proxy_url = os.environ.get("DOCKER_PROXY_URL", "http://docker-proxy:2375")
     try:
-        subprocess.run(
-            ["docker", "restart", container],
-            capture_output=True, timeout=15,
+        resp = _requests.post(
+            f"{proxy_url}/containers/{container}/restart",
+            params={"t": 10},
+            timeout=20,
         )
-        logger.info(f"Restarted container: {container}")
+        if resp.status_code in (204, 200):
+            logger.info(f"Restarted container: {container}")
+        else:
+            logger.warning(
+                f"Could not restart {container}: HTTP {resp.status_code} {resp.text[:200]}"
+            )
     except Exception as exc:
         logger.warning(f"Could not restart {container}: {exc}")
 
@@ -856,18 +907,19 @@ async def audit_health():
 async def persistence_health():
     """Check if database persistence is working."""
     try:
-        # Test database connection
+        # Test database connection with a read-only query (BUG-03 fix).
+        # Never write TEST rows to the production database from a health check.
         async with async_session() as session:
-            await session.execute(text("SELECT 1"))
-        
-        # Test repository operations
-        await repo.log_regime("TEST", {}, False)
+            result = await session.execute(text("SELECT 1"))
+            reachable = result.scalar() == 1
+
         history = await repo.get_recent_regime_log(limit=1)
-        
+
         return {
             "status": "ok",
             "database_path": str(_DB_PATH),
-            "regime_log_test": len(history) > 0,
+            "db_reachable":    reachable,
+            "regime_log_rows": len(history),
         }
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
@@ -877,13 +929,21 @@ async def persistence_health():
 async def locks_health():
     """Check if state locking is working."""
     try:
-        # Test concurrent access to state
+        # Test concurrent access to state then immediately clean up (BUG-02 fix).
+        # "test_worker" must not persist in worker_pnl after this health check.
+        _HEALTH_TEST_WORKER = "__health_lock_test__"
+
         async def test_update():
-            await state.update_worker_pnl("test_worker", 100.0)
+            await state.update_worker_pnl(_HEALTH_TEST_WORKER, 100.0)
             snap = await state.get_snapshot()
-            return snap["worker_pnl"].get("test_worker")
-        
+            return snap["worker_pnl"].get(_HEALTH_TEST_WORKER)
+
         results = await asyncio.gather(*[test_update() for _ in range(5)])
+
+        # Remove the ephemeral test entry from live state
+        async with state._lock:
+            state.worker_pnl.pop(_HEALTH_TEST_WORKER, None)
+
         return {
             "status": "ok",
             "concurrent_updates": all(r == 100.0 for r in results),
@@ -914,7 +974,10 @@ async def setup_status():
         "ntfy_configured":               bool(env.get("NTFY_TOPIC")),
         "ollama_ready":                  ollama_ok,
         "setup_complete":                env.get("SETUP_COMPLETE", "false") == "true",
-        "api_key":                       _api_key,
+        # api_key is only included before setup is complete so the dashboard
+        # can persist it in localStorage on first load. Once setup_complete=true
+        # the key must not be re-exposed via this unauthenticated endpoint.
+        **({"api_key": _api_key} if env.get("SETUP_COMPLETE", "false") != "true" else {}),
     }
 
 
@@ -951,7 +1014,11 @@ async def save_credentials(body: dict):
         if key in _CONTAINER_RESTART_MAP:
             containers_to_restart.add(_CONTAINER_RESTART_MAP[key])
 
-    env_path.write_text(env_content)
+    # Atomic write: write to a temp file then rename so a crash mid-write never
+    # leaves a partial/corrupt .env (rename is atomic on POSIX filesystems).
+    tmp_path = env_path.with_suffix(".tmp")
+    tmp_path.write_text(env_content)
+    os.replace(tmp_path, env_path)
     logger.info(f"setup/credentials: wrote {updated_keys}")
 
     loop = asyncio.get_running_loop()
@@ -963,6 +1030,129 @@ async def save_credentials(body: dict):
         fut.add_done_callback(lambda f: f.exception())
 
     return {"status": "saved", "keys_updated": updated_keys}
+
+
+# ── Dashboard State Endpoint (FEAT-01) ────────────────────────────────────────
+
+@app.get("/dashboard/state")
+async def dashboard_state():
+    """
+    Full data snapshot consumed by the React dashboard every 10 seconds.
+    Returns all top-level keys the dashboard expects:
+      regime, conflict_score, circuit_breaker, risk, portfolio, workers,
+      domain_signals, timeline, thesis, backtest, system
+    All fields are derived from live HypervisorState — no external calls.
+    """
+    import platform
+    snap = await state.get_snapshot()
+
+    # ── System metrics ─────────────────────────────────────────────────────
+    try:
+        import psutil
+        cpu_pct  = psutil.cpu_percent(interval=None)
+        ram      = psutil.virtual_memory()
+        ram_pct  = ram.percent
+        disk     = psutil.disk_usage("/")
+        disk_pct = disk.percent
+        # CPU temperature — Pi 5 / Linux only; returns None on x86 dev
+        temp_c: Optional[float] = None
+        temps = getattr(psutil, "sensors_temperatures", lambda: {})()
+        if temps:
+            for key in ("cpu_thermal", "coretemp", "k10temp"):
+                if key in temps and temps[key]:
+                    temp_c = round(temps[key][0].current, 1)
+                    break
+        ollama_online = await _check_ollama_health()
+        system_info: Dict[str, Any] = {
+            "cpu_pct":      round(cpu_pct, 1),
+            "ram_pct":      round(ram_pct, 1),
+            "disk_pct":     round(disk_pct, 1),
+            "temp_c":       temp_c,
+            "ollama_online": ollama_online,
+        }
+    except Exception:
+        system_info = {
+            "cpu_pct": 0.0, "ram_pct": 0.0, "disk_pct": 0.0,
+            "temp_c": None, "ollama_online": False,
+        }
+
+    # ── Portfolio ──────────────────────────────────────────────────────────
+    total_pnl = sum(snap["worker_pnl"].values())
+    total_val = round(snap["total_capital"] + total_pnl, 2) if not PAPER_TRADING else round(snap["total_capital"], 2)
+    deployed  = round(sum(snap["allocations"].values()), 2)
+    gain_pct  = round((total_val - INITIAL_CAPITAL_USD) / INITIAL_CAPITAL_USD, 4) if INITIAL_CAPITAL_USD else 0.0
+    portfolio: Dict[str, Any] = {
+        "total_value":    total_val,
+        "deployed_usd":   deployed,
+        "cash_usd":       round(snap["free_capital"], 2),
+        "total_gain_pct": gain_pct,
+        "positions":      [],  # populated by individual worker /status calls in the cycle
+    }
+
+    # ── Risk ───────────────────────────────────────────────────────────────
+    open_positions = sum(
+        s.get("open_positions", 0)
+        for s in state.worker_status.values()
+        if isinstance(s, dict)
+    )
+    drawdown_pct = risk_mgr._portfolio_drawdown(snap["total_capital"])
+    # Composite risk score 0-100: 70% drawdown exposure, 30% position utilisation
+    risk_score = min(
+        100,
+        round(
+            (drawdown_pct / 0.20) * 70
+            + (open_positions / 6) * 30
+        ),
+    )
+    risk_info: Dict[str, Any] = {
+        "score":          risk_score,
+        "drawdown_pct":   round(drawdown_pct, 4),
+        "open_positions": open_positions,
+        "var_pct":        0.0,   # populated when live VaR tracking is added
+    }
+
+    # ── Workers ────────────────────────────────────────────────────────────
+    workers_info: Dict[str, Any] = {}
+    for worker in WORKER_REGISTRY:
+        ws = state.worker_status.get(worker) or {}
+        workers_info[worker] = {
+            "status":         "ok" if snap["worker_health"].get(worker) else "unreachable",
+            "paused":         ws.get("paused", False),
+            "pnl":            round(snap["worker_pnl"].get(worker, 0.0), 2),
+            "sharpe":         round(snap["worker_sharpe"].get(worker) or 0.0, 3),
+            "allocated_usd":  round(snap["allocations"].get(worker, 0.0), 2),
+            "open_positions": ws.get("open_positions", 0),
+        }
+
+    # ── Regime ─────────────────────────────────────────────────────────────
+    regime_info: Dict[str, Any] = {
+        "label":         snap["regime"],
+        "confidence":    round(snap["regime_confidence"], 3),
+        "probabilities": snap["regime_probs"],
+    }
+
+    # ── Thesis (simplified — full thesis built by analyst worker) ──────────
+    thesis: Dict[str, Any] = {
+        "outlook":       "cautious" if snap["halted"] else "neutral",
+        "drivers":       [],
+        "signal_score":  0.0,
+        "confidence":    round(snap["regime_confidence"], 3),
+        "risk_approved": not snap["halted"],
+    }
+
+    return {
+        "regime":         regime_info,
+        "conflict_score": 0,        # populated by conflict_index cycle step when available
+        "circuit_breaker": snap["circuit_breaker"],
+        "risk":           risk_info,
+        "portfolio":      portfolio,
+        "workers":        workers_info,
+        "domain_signals": [],       # populated by domain_router cycle step when available
+        "timeline":       [],       # populated from audit log when available
+        "thesis":         thesis,
+        "backtest":       {"strategies": []},
+        "system":         system_info,
+    }
 
 
 # ── Startup Configuration Validation ──────────────────────────────────────────
@@ -986,8 +1176,8 @@ def validate_config():
     cycle = os.environ.get("CYCLE_INTERVAL_SEC", "60")
     try:
         c = int(cycle)
-        if c < 10 or c > 600:
-            errors.append("CYCLE_INTERVAL_SEC must be 10-600")
+        if c < 10 or c > 3600:
+            errors.append("CYCLE_INTERVAL_SEC must be 10-3600")
     except ValueError:
         errors.append("CYCLE_INTERVAL_SEC must be an integer")
 
@@ -1000,13 +1190,12 @@ def validate_config():
                  "AISSTREAM_API_KEY", "TELEGRAM_BOT_TOKEN"]
     for key in optional:
         if not os.environ.get(key):
-            logger.info("optional_key_missing", key=key)
+            logger.info("Optional env var not set: %s", key)
 
     if errors:
         for e in errors:
-            logger.error("config_validation_failed", error=e)
+            logger.error("Config validation failed: %s", e)
         raise SystemExit(f"Configuration invalid: {'; '.join(errors)}")
 
 
-# Call validation at startup
-validate_config()
+# validate_config() is called inside lifespan() — not at import time (BUG-04)

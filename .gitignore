@@ -77,6 +77,8 @@ logs/
 data/backtest/
 data/db/*.sqlite
 data/db/*.sqlite3
+data/arka.db
+data/audit.jsonl
 *.csv
 
 # Config — optimizer output is generated, not source-controlled by default

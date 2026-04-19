@@ -40,14 +40,14 @@
 
 ### Test Coverage
 
-- [ ] **COVER-01**: HMM state label ordering must be tested for consistency between `hypervisor/regime/hmm_model.py` (`STATE_LABELS`) and `hypervisor/allocator/capital.py` (`HMM_STATE_LABELS`). A mismatch silently routes capital to wrong regimes.
-- [ ] **COVER-02**: `/health/locks` state pollution must be tested: calling the endpoint must not leave `"test_worker"` in `worker_pnl` or affect subsequent capital reconciliation results.
-- [ ] **COVER-03**: `/health/persistence` database pollution must be tested: calling the endpoint must not create `regime="TEST"` rows in `data/arka.db`.
-- [ ] **COVER-04**: `hypervisor/db/` repository layer must have integration tests covering regime logging, portfolio writes, and read-back.
-- [ ] **COVER-05**: Dashboard setup endpoints (`/setup/credentials`, `/setup/status`, `/system/hardware`) must have tests covering credential write atomicity, partial updates, and container restart behavior.
-- [ ] **COVER-06**: `hypervisor/di_container.py` `Hypervisor` class must either be wired into `main.py` and tested, or deleted. Dead code that duplicates production logic is not acceptable.
-- [ ] **COVER-07**: `workers/arbitrader/sidecar/main.py` paper arb simulator and REST contract must have at least smoke-test coverage.
-- [ ] **COVER-08**: Overall test count must reach 150+ passing with 0 new failures. All new safety/concurrency test files (`test_safety_rails.py`, `test_concurrency.py`) must contribute substantively.
+- [x] **COVER-01**: HMM state label ordering must be tested for consistency between `hypervisor/regime/hmm_model.py` (`STATE_LABELS`) and `hypervisor/allocator/capital.py` (`HMM_STATE_LABELS`). A mismatch silently routes capital to wrong regimes.
+- [x] **COVER-02**: `/health/locks` state pollution must be tested: calling the endpoint must not leave `"test_worker"` in `worker_pnl` or affect subsequent capital reconciliation results.
+- [x] **COVER-03**: `/health/persistence` database pollution must be tested: calling the endpoint must not create `regime="TEST"` rows in `data/arka.db`.
+- [x] **COVER-04**: `hypervisor/db/` repository layer must have integration tests covering regime logging, portfolio writes, and read-back.
+- [x] **COVER-05**: Dashboard setup endpoints (`/setup/credentials`, `/setup/status`, `/system/hardware`) must have tests covering credential write atomicity, partial updates, and container restart behavior.
+- [x] **COVER-06**: `hypervisor/di_container.py` `Hypervisor` class must either be wired into `main.py` and tested, or deleted. Dead code that duplicates production logic is not acceptable.
+- [x] **COVER-07**: `workers/arbitrader/sidecar/main.py` paper arb simulator and REST contract must have at least smoke-test coverage.
+- [x] **COVER-08**: Overall test count must reach 150+ passing with 0 new failures. All new safety/concurrency test files (`test_safety_rails.py`, `test_concurrency.py`) must contribute substantively.
 
 ### Code Quality & Fragile Patterns
 

@@ -44,12 +44,31 @@ except ImportError:
     pass
 
 BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+_raw_uid    = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "")
 try:
-    ALLOWED_UID = int(os.environ.get("TELEGRAM_ALLOWED_USER_ID", "0"))
+    ALLOWED_UID = int(_raw_uid) if _raw_uid else 0
 except ValueError:
     ALLOWED_UID = 0
     logger.warning("TELEGRAM_ALLOWED_USER_ID is not a valid integer — all users will be rejected")
+if not _raw_uid:
+    logger.warning(
+        "TELEGRAM_ALLOWED_USER_ID not set — all commands will be rejected. "
+        "Set your numeric Telegram user ID in .env to enable the bot."
+    )
 HYPER_URL   = os.environ.get("HYPERVISOR_URL", "http://hypervisor:8000")
+
+# Hypervisor Bearer token — written to .env by the hypervisor on first start.
+# The docker-compose env_file: .env ensures it lands in this container's env.
+_ARKA_API_KEY = os.environ.get("ARKA_API_KEY", "")
+_HYPER_HEADERS: dict = (
+    {"Authorization": f"Bearer {_ARKA_API_KEY}"}
+    if _ARKA_API_KEY else {}
+)
+if not _ARKA_API_KEY:
+    logger.warning(
+        "ARKA_API_KEY not set — all hypervisor requests will return 401. "
+        "Ensure the hypervisor has started at least once so it writes the key to .env."
+    )
 
 if not BOT_TOKEN:
     logger.warning(
@@ -78,14 +97,14 @@ async def _deny(update: Update):
 
 async def _get(path: str) -> dict:
     async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.get(f"{HYPER_URL}{path}")
+        r = await client.get(f"{HYPER_URL}{path}", headers=_HYPER_HEADERS)
         r.raise_for_status()
         return r.json()
 
 
 async def _post(path: str, payload: dict = None) -> dict:
     async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.post(f"{HYPER_URL}{path}", json=payload or {})
+        r = await client.post(f"{HYPER_URL}{path}", json=payload or {}, headers=_HYPER_HEADERS)
         r.raise_for_status()
         return r.json()
 

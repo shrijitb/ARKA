@@ -173,6 +173,20 @@ class StrategyState:
         if self.paused or self.bias == "flat" or self.allocated_usd < 10.0:
             return None
 
+        # ── Check exits for open positions before looking for new entries ────
+        if self._positions:
+            try:
+                from strategies.swing_macd import _synthetic_ohlcv
+                current_prices: Dict[str, float] = {}
+                for pair in list(self._positions.keys()):
+                    bars = _synthetic_ohlcv(pair)
+                    if bars:
+                        current_prices[pair] = float(bars[-1][4])  # last close
+                if current_prices:
+                    await self.check_exits(current_prices)
+            except Exception as exc:
+                logger.debug("exit_check_failed", error=str(exc))
+
         pairs   = list(OKX_INSTRUMENTS.keys())
         routed  = self._adx_routed_strategy(pairs)
         signal  = None

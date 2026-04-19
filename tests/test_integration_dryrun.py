@@ -578,15 +578,15 @@ class TestHypervisorCycle:
 
     def test_reconcile_capital_math(self, hyp):
         # Test live-mode math: PAPER_TRADING=False so PnL is added to capital.
-        # _reconcile_capital reads state.allocations (authoritative hypervisor view),
-        # not state.worker_allocated (lagging worker-reported view).
-        orig_paper             = hyp.PAPER_TRADING
-        hyp.PAPER_TRADING      = False
+        # reconcile_capital is an async method on HypervisorState; run via asyncio.
+        import asyncio
+        orig_paper              = hyp.PAPER_TRADING
+        hyp.PAPER_TRADING       = False
         hyp.INITIAL_CAPITAL_USD = 200.0
-        hyp.state.worker_pnl   = {"nautilus": 5.0, "analyst": -2.0}
-        hyp.state.allocations  = {"nautilus": 80.0, "analyst": 60.0}
+        hyp.state.worker_pnl    = {"nautilus": 5.0, "analyst": -2.0}
+        hyp.state.allocations   = {"nautilus": 80.0, "analyst": 60.0}
 
-        hyp._reconcile_capital()
+        asyncio.run(hyp.state.reconcile_capital())
 
         expected_total = 200.0 + 5.0 + (-2.0)    # 203.0
         expected_free  = 203.0 - (80.0 + 60.0)   # 63.0
@@ -603,7 +603,7 @@ class TestHypervisorCycle:
             f"  got:      ${hyp.state.free_capital:.2f}\n"
             f"  formula:  total_capital - sum(state.allocations)"
         )
-        print(f"\n  Capital reconciled: total=${hyp.state.total_capital:.2f}  free=${hyp.state.free_capital:.2f}")
+        print(f"\n  Capital reconciled: total=${hyp.state.total_capital:.2f}  free={hyp.state.free_capital:.2f}")
         hyp.PAPER_TRADING = orig_paper
 
     def test_open_position_count_sums_across_workers(self, hyp):
@@ -735,3 +735,165 @@ class TestEndToEndSignalSchema:
             f"  FIX: POST /execute in analyst/worker_api.py must always set status='advisory_only'"
         )
         print(f"\n  [analyst] /execute correctly advisory_only: {body}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 4 — Security Hardening
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestSecurityHardening:
+    """
+    Verifies the three Phase-4 security hardening changes:
+
+    SEC-01  CORS is restricted — wildcard origin ("*") is not present in the
+            hypervisor app's CORS middleware configuration.
+
+    SEC-02  .env writes are atomic — /setup/credentials uses os.replace() so a
+            crash mid-write cannot leave a partial/corrupt .env file.
+
+    SEC-03  Docker socket is not mounted directly — the compose file no longer
+            has /var/run/docker.sock in the hypervisor service volumes; container
+            restarts go through the docker-socket-proxy sidecar.
+    """
+
+    # ── SEC-01: CORS ──────────────────────────────────────────────────────────
+
+    def test_cors_wildcard_not_in_hypervisor_middleware(self):
+        """
+        The CORSMiddleware must NOT use allow_origins=["*"].
+        Reads main.py source to confirm no wildcard origin is present.
+        """
+        import ast
+        import pathlib
+
+        main_src = (pathlib.Path(_PROJECT) / "hypervisor" / "main.py").read_text()
+
+        # Quick string check — wildcard in allow_origins string
+        assert '"*"' not in main_src or 'allow_origins=["*"]' not in main_src, (
+            "hypervisor/main.py still uses allow_origins=['*'] — "
+            "restrict CORS to known dashboard origins"
+        )
+
+        # More robust: confirm _cors_allowed_origins does not contain "*"
+        # by evaluating the default expression in isolation
+        assert "allow_origins=[\"*\"]" not in main_src, (
+            "Literal allow_origins=['*'] found in hypervisor/main.py — "
+            "must be replaced with specific origin list or env-var-driven list"
+        )
+
+    def test_cors_default_allows_dashboard_port(self):
+        """
+        The default CORS origin list must include the dashboard port (3000)
+        and the Vite dev server port (5173).
+        """
+        import pathlib
+
+        main_src = (pathlib.Path(_PROJECT) / "hypervisor" / "main.py").read_text()
+        assert "3000" in main_src, (
+            "Dashboard port 3000 not found in CORS origin defaults in hypervisor/main.py"
+        )
+        assert "5173" in main_src, (
+            "Vite dev port 5173 not found in CORS origin defaults in hypervisor/main.py"
+        )
+
+    # ── SEC-02: Atomic .env write ─────────────────────────────────────────────
+
+    def test_env_write_uses_os_replace(self):
+        """
+        /setup/credentials must write via os.replace() (atomic rename) rather
+        than direct write_text() to prevent partial-write corruption on power loss.
+        """
+        import pathlib
+
+        main_src = (pathlib.Path(_PROJECT) / "hypervisor" / "main.py").read_text()
+        assert "os.replace(" in main_src, (
+            "hypervisor/main.py save_credentials does not use os.replace() — "
+            "direct write_text() on .env is not atomic and can corrupt on power loss"
+        )
+        assert ".tmp" in main_src, (
+            "No .tmp temp file found in save_credentials — "
+            "atomic write pattern requires: write to .tmp then os.replace() to target"
+        )
+
+    def test_atomic_write_leaves_original_intact_on_failure(self, tmp_path):
+        """
+        Simulate the atomic write pattern: if the process dies after writing .tmp
+        but before os.replace(), the original file must still be intact.
+        """
+        import os
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=original_value\n")
+
+        # Simulate: write .tmp but do NOT call os.replace() (crash scenario)
+        tmp_file = tmp_path / ".env.tmp"
+        tmp_file.write_text("KEY=partial_corrupt\n")
+
+        # Original must still be intact
+        assert env_file.read_text() == "KEY=original_value\n", (
+            "Original .env was corrupted before os.replace() completed — "
+            "atomic write pattern broken"
+        )
+
+        # Now complete the replace — original should be updated
+        os.replace(tmp_file, env_file)
+        assert env_file.read_text() == "KEY=partial_corrupt\n"
+        assert not tmp_file.exists(), "Temp file should be gone after os.replace()"
+
+    # ── SEC-03: Docker socket not mounted directly ────────────────────────────
+
+    def test_docker_socket_not_in_hypervisor_volumes(self):
+        """
+        docker-compose.yml must not mount /var/run/docker.sock into the hypervisor
+        service. Container restarts must go through the scoped docker-socket-proxy.
+        """
+        import pathlib
+        import yaml  # pyyaml is a transitive dep via several packages
+
+        compose_path = pathlib.Path(_PROJECT) / "docker-compose.yml"
+        compose = yaml.safe_load(compose_path.read_text())
+        hypervisor_vols = compose.get("services", {}).get("hypervisor", {}).get("volumes", [])
+
+        for vol in hypervisor_vols:
+            vol_str = str(vol)
+            assert "/var/run/docker.sock" not in vol_str, (
+                f"docker-compose.yml still mounts /var/run/docker.sock into hypervisor: {vol_str}\n"
+                "Remove this mount; container restarts should go through docker-socket-proxy"
+            )
+
+    def test_docker_proxy_service_exists_in_compose(self):
+        """
+        docker-compose.yml must define a docker-proxy service (or equivalent)
+        that provides scoped Docker API access to the hypervisor.
+        """
+        import pathlib
+        import yaml
+
+        compose_path = pathlib.Path(_PROJECT) / "docker-compose.yml"
+        compose = yaml.safe_load(compose_path.read_text())
+        services = compose.get("services", {})
+
+        assert "docker-proxy" in services, (
+            "docker-compose.yml missing 'docker-proxy' service — "
+            "the hypervisor must reach Docker API through a scoped proxy, not the raw socket"
+        )
+
+    def test_hypervisor_restart_uses_http_not_cli(self):
+        """
+        _restart_container in hypervisor/main.py must use HTTP (requests.post)
+        to talk to the proxy, not subprocess.run(['docker', 'restart', ...]).
+        """
+        import pathlib
+
+        main_src = (pathlib.Path(_PROJECT) / "hypervisor" / "main.py").read_text()
+
+        # The function must use requests HTTP call
+        assert "DOCKER_PROXY_URL" in main_src, (
+            "_restart_container does not reference DOCKER_PROXY_URL — "
+            "it must call the docker-socket-proxy via HTTP"
+        )
+        # Must not shell out to docker CLI for restarts
+        assert '["docker", "restart"' not in main_src, (
+            "_restart_container still uses subprocess(['docker', 'restart', ...]) — "
+            "replace with HTTP call to docker-socket-proxy"
+        )

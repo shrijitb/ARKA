@@ -56,6 +56,22 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# ── War premium score cache (BUG-07) ──────────────────────────────────────────
+# get_war_premium_score() caches its result for _SCORE_CACHE_TTL seconds.
+# Subsequent calls within the TTL return instantly instead of sleeping 10.5s.
+_SCORE_CACHE_TTL    = 300.0   # 5-minute TTL
+_cached_score: float     = 0.0
+_cache_timestamp: float  = 0.0
+_cache_lock = None   # threading.Lock — created lazily to avoid import at module load
+
+
+def _get_cache_lock():
+    global _cache_lock
+    if _cache_lock is None:
+        import threading
+        _cache_lock = threading.Lock()
+    return _cache_lock
+
 
 # ── GDELT constants (kept here for backward-compatible test imports) ───────────
 GDELT_API   = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -382,7 +398,17 @@ def get_war_premium_score() -> float:
     Tier 1: market proxy 50%.
     Tier 2: OSINT layer 50% (8 sources, dynamic redistribution).
         gdelt, edgar, ucdp, maritime, firms, usgs, aviation, company_intel
+
+    Result is cached for _SCORE_CACHE_TTL seconds (default 5 min) so the
+    GDELT 10.5s sleep does not block every hypervisor cycle.
     """
+    global _cached_score, _cache_timestamp
+    lock = _get_cache_lock()
+    with lock:
+        if time.monotonic() - _cache_timestamp < _SCORE_CACHE_TTL:
+            logger.debug(f"War premium score (cached): {_cached_score}/100")
+            return _cached_score
+
     market = _fetch_market_proxy()
     ms     = _score_market_proxy(market)
 
@@ -393,6 +419,9 @@ def get_war_premium_score() -> float:
         f"War Premium Score: {score}/100 "
         f"(market={ms} osint={osint_score})"
     )
+    with lock:
+        _cached_score    = score
+        _cache_timestamp = time.monotonic()
     return score
 
 

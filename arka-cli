@@ -36,8 +36,19 @@ def run_cmd(cmd, capture_output=True, check=True):
         return result
     except subprocess.CalledProcessError as e:
         print(f"Error running command: {cmd}")
-        print(f"Error: {e.stderr}")
+        if e.stderr:
+            print(f"Error: {e.stderr}")
         return None
+
+
+def _compose_args() -> str:
+    """Return -f flags for docker compose based on which files are present."""
+    base = Path(ARKA_DIR) / "docker-compose.yml"
+    profile = Path(ARKA_DIR) / "docker-compose.profile.yml"
+    args = f"-f {base}"
+    if profile.exists():
+        args += f" -f {profile}"
+    return args
 
 def check_service_health(url: str, timeout: int = 5) -> bool:
     """Check if a service is healthy"""
@@ -88,18 +99,16 @@ def launch_dashboard_popup():
 def start_services():
     """Start Arka services"""
     os.chdir(ARKA_DIR)
-    
-    # Check if docker-compose files exist
-    compose_files = ["docker-compose.yml", "docker-compose.profile.yml"]
-    if not all(Path(f).exists() for f in compose_files):
-        print("❌ Docker compose files not found. Please run 'arka install' first.")
+
+    if not (Path(ARKA_DIR) / "docker-compose.yml").exists():
+        print("❌ docker-compose.yml not found. Please run 'arka install' first.")
         return False
-    
+
     print("🚀 Starting Arka services...")
-    result = run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml up -d")
+    result = run_cmd(f"docker compose {_compose_args()} up -d")
     if result is None:
         return False
-    
+
     print("✅ Services started")
     return True
 
@@ -107,7 +116,7 @@ def stop_services():
     """Stop Arka services"""
     os.chdir(ARKA_DIR)
     print("🛑 Stopping Arka services...")
-    result = run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml down")
+    result = run_cmd(f"docker compose {_compose_args()} down")
     if result is None:
         return False
     print("✅ Services stopped")
@@ -143,7 +152,10 @@ def show_status():
     # Check Docker containers
     print()
     print("🐳 Docker Containers:")
-    result = run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml ps --format 'table {{.Name}}\\t{{.Status}}\\t{{.Ports}}'", capture_output=True, check=False)
+    result = run_cmd(
+        f"docker compose {_compose_args()} ps --format 'table {{{{.Name}}}}\\t{{{{.Status}}}}\\t{{{{.Ports}}}}'",
+        capture_output=True, check=False,
+    )
     if result:
         print(result.stdout)
 
@@ -152,7 +164,8 @@ def show_logs():
     os.chdir(ARKA_DIR)
     print("📋 Arka Logs (last 100 lines)")
     print("=" * 50)
-    run_cmd("docker compose -f docker-compose.yml -f docker-compose.profile.yml logs --tail=100")
+    # capture_output=False lets docker's output stream directly to the terminal.
+    run_cmd(f"docker compose {_compose_args()} logs --tail=100", capture_output=False)
 
 def install_arka():
     """Run Arka installation"""

@@ -44,15 +44,35 @@ N_FEATURES = 6
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _safe_last_close(df: pd.DataFrame) -> Optional[float]:
-    """Extract last close from a yfinance DataFrame (handles MultiIndex)."""
+def _safe_last_close(
+    df: pd.DataFrame,
+    min_price: float = 0.0,
+    max_price: float = 1_000_000.0,
+    ticker: str = "",
+) -> Optional[float]:
+    """
+    Extract last close from a yfinance DataFrame (handles MultiIndex).
+
+    Raises ValueError if the returned price is outside [min_price, max_price],
+    which catches yfinance returning 0.0, NaN-as-zero, or implausibly large
+    values caused by unadjusted splits or data errors.
+    """
     if df is None or df.empty:
         return None
     col = df["Close"]
     if isinstance(col, pd.DataFrame):
         col = col.iloc[:, 0]
     col = col.dropna()
-    return float(col.iloc[-1]) if not col.empty else None
+    if col.empty:
+        return None
+    value = float(col.iloc[-1])
+    if not (min_price < value <= max_price):
+        raise ValueError(
+            f"Implausible close price for {ticker!r}: {value} "
+            f"(expected {min_price} < price <= {max_price}). "
+            "yfinance may have returned corrupt or unadjusted data."
+        )
+    return value
 
 
 def _fetch_fred(series_ids: list, start: str) -> pd.DataFrame:
@@ -311,20 +331,20 @@ class FeaturePipeline:
         # Feature 0: VIX level
         try:
             df = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
-            v = _safe_last_close(df)
+            v = _safe_last_close(df, min_price=0.0, max_price=200.0, ticker="^VIX")
             if v is not None:
                 raw["vix_level"] = v
         except Exception as e:
-            logger.debug(f"VIX fetch: {e}")
+            logger.warning(f"VIX fetch rejected or failed: {e}")
 
         # Feature 1: VIX term structure
         try:
             df3m = yf.download("^VIX3M", period="5d", progress=False, auto_adjust=True)
-            v3m  = _safe_last_close(df3m)
+            v3m  = _safe_last_close(df3m, min_price=0.0, max_price=200.0, ticker="^VIX3M")
             if v3m is not None and raw["vix_level"] > 0:
                 raw["vix_term_structure"] = v3m / raw["vix_level"] - 1.0
         except Exception as e:
-            logger.debug(f"VIX3M fetch: {e}")
+            logger.warning(f"VIX3M fetch rejected or failed: {e}")
 
         # Feature 2: yield spread (reuse existing market_data helper)
         try:
@@ -360,10 +380,14 @@ class FeaturePipeline:
                 if len(col) >= 60:
                     spy_now = float(col.iloc[-1])
                     spy_60d = float(col.iloc[-60])
-                    if spy_60d > 0:
-                        raw["equity_momentum_60d"] = float(np.log(spy_now / spy_60d))
+                    if spy_now <= 0 or spy_60d <= 0:
+                        raise ValueError(
+                            f"Implausible SPY close prices: now={spy_now}, 60d={spy_60d}. "
+                            "yfinance may have returned corrupt or unadjusted data."
+                        )
+                    raw["equity_momentum_60d"] = float(np.log(spy_now / spy_60d))
         except Exception as e:
-            logger.debug(f"SPY momentum: {e}")
+            logger.warning(f"SPY momentum rejected or failed: {e}")
 
         self._last_raw = raw
         return raw

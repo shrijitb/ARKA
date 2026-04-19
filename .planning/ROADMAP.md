@@ -10,8 +10,8 @@ This milestone hardens the Arka trading system before Phase 3 live trading begin
 - [x] **Phase 2: Missing Critical Features** - Implement the missing dashboard state endpoint, Telegram auth guard, and resolve the arbitrader status ambiguity
 - [x] **Phase 3: Safety Rails Coverage** - Achieve full test coverage for margin_reserve, expiry_guard, circuit_breaker, audit, and auth key exposure
 - [x] **Phase 4: Security Hardening** - Restrict CORS origins, make credential writes atomic, and replace the Docker socket mount
-- [ ] **Phase 5: Test Coverage Expansion** - Reach 150+ passing tests covering DB layer, setup endpoints, HMM label consistency, health-check pollution, and arbitrader contract
-- [ ] **Phase 6: Code Quality & Fragile Pattern Remediation** - Fix nautilus data feed isolation, gate Phase 3 stubs, ship HMM model in Docker image, pin hmmlearn, and guard yfinance data quality
+- [x] **Phase 5: Test Coverage Expansion** - Reach 150+ passing tests covering DB layer, setup endpoints, HMM label consistency, health-check pollution, and arbitrader contract
+- [x] **Phase 6: Code Quality & Fragile Pattern Remediation** - Fix nautilus data feed isolation, gate Phase 3 stubs, ship HMM model in Docker image, pin hmmlearn, and guard yfinance data quality
 - [ ] **Phase 7: Stress Test & Sign-Off** - Run 24–48 hour paper trading stress test and produce a documented pass/fail verdict
 
 ## Phase Details
@@ -102,6 +102,6 @@ This milestone hardens the Arka trading system before Phase 3 live trading begin
 | 2. Missing Critical Features | Done | Complete | ✅ |
 | 3. Safety Rails Coverage | Done | Complete | ✅ |
 | 4. Security Hardening | Done | Complete | ✅ |
-| 5. Test Coverage Expansion | 0/TBD | Not started | - |
-| 6. Code Quality & Fragile Patterns | 0/TBD | Not started | - |
+| 5. Test Coverage Expansion | 38 tests | Complete | ✅ |
+| 6. Code Quality & Fragile Patterns | 18 tests | Complete | ✅ |
 | 7. Stress Test & Sign-Off | 0/TBD | Not started | - |

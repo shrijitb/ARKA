@@ -9,7 +9,7 @@
     "build":           "vite build",
     "preview":         "vite preview",
 
-    "electron:dev":    "ELECTRON_IS_DEV=1 concurrently \"vite\" \"wait-on tcp:5173 && electron .\"",
+    "electron:dev":    "cross-env ELECTRON_IS_DEV=1 concurrently \"vite\" \"wait-on tcp:5173 && electron .\"",
     "electron:build":  "vite build && electron-builder",
 
     "cap:sync":        "vite build && cap sync",
@@ -28,6 +28,7 @@
     "@tailwindcss/vite":    "^4.0.0",
     "@vitejs/plugin-react": "^4.3.0",
     "concurrently":         "^9.0.0",
+    "cross-env":            "^7.0.0",
     "electron":             "^33.0.0",
     "electron-builder":     "^25.0.0",
     "tailwindcss":          "^4.0.0",

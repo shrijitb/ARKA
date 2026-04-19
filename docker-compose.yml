@@ -9,7 +9,7 @@ services:
   # To deploy to Pi: docker compose -f docker-compose.yml -f docker-compose.pi.yml ...
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.21.0
     container_name: arka-ollama
     volumes:
       - ollama_data:/root/.ollama
@@ -27,6 +27,21 @@ services:
       retries: 6
       start_period: 30s
 
+  # Scoped Docker API proxy — exposes only POST /containers/*/restart.
+  # The hypervisor calls this instead of mounting /var/run/docker.sock directly,
+  # so a compromised hypervisor cannot run docker exec, pull images, etc.
+  docker-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.4.2
+    container_name: arka-docker-proxy
+    environment:
+      # Allow only container restart; everything else defaults to 0 (denied).
+      CONTAINERS: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+    # No external port — only accessible inside the Docker network.
+
   hypervisor:
     # Build context is project root so data/ and config/ are reachable.
     # hypervisor/main.py imports from data.feeds.market_data at runtime —
@@ -38,6 +53,8 @@ services:
     depends_on:
       ollama:
         condition: service_started
+      docker-proxy:
+        condition: service_started
     ports:
       - "8000:8000"
     volumes:
@@ -45,8 +62,8 @@ services:
       - ./data/db:/app/data/db
       # Writable .env so /setup/credentials can persist credentials
       - ./.env:/app/.env
-      # Docker socket so the hypervisor can restart sibling containers after credential save
-      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      DOCKER_PROXY_URL: "http://docker-proxy:2375"
     env_file: .env
     restart: unless-stopped
     healthcheck:
@@ -67,7 +84,9 @@ services:
     restart: unless-stopped
 
   worker-nautilus:
-    build: ./workers/nautilus
+    build:
+      context: .
+      dockerfile: workers/nautilus/Dockerfile
     container_name: arka-nautilus
     depends_on:
       hypervisor:
@@ -151,7 +170,7 @@ services:
       start_period: 15s
 
   searxng:
-    image: searxng/searxng:latest
+    image: searxng/searxng:2026.4.17-e8299a4c3
     container_name: arka-searxng
     ports:
       - "8080:8080"

@@ -249,6 +249,10 @@ class RiskManager:
             )
         return "\n".join(lines)
 
+    def get_drawdown_pct(self, current_capital: float) -> float:
+        """Current portfolio drawdown fraction from peak. Public accessor for persistence."""
+        return self._portfolio_drawdown(current_capital)
+
     def reset_halt(self) -> None:
         """Manually clear the halt cooldown (use after reviewing situation)."""
         logger.warning("RiskManager: halt cooldown manually cleared")

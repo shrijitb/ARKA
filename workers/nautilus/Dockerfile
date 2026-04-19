@@ -1,9 +1,12 @@
 # workers/nautilus/Dockerfile
 #
-# Build context: ./workers/nautilus
+# Build context: project root (.)
 # After COPY the container layout is:
 #   /app/worker_api.py
+#   /app/indicators/adx.py
 #   /app/strategies/swing_macd.py
+#   /app/data/feeds/funding_rates.py  (live OKX feed)
+#   /app/data/feeds/order_book.py     (live OKX order book)
 #
 # nautilus_trader notes:
 #   Requires Rust toolchain to build from source on ARM64 slim images.
@@ -53,11 +56,18 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir nautilus_trader \
     || echo "WARNING: nautilus_trader install failed. Starting in paper simulation mode."
 
-COPY . .
+# Copy worker source from project root build context.
+COPY workers/nautilus/ .
 
-# strategies/ subdir is included in the COPY above.
-# worker_api.py imports: from strategies.swing_macd import evaluate_signal
-# PYTHONPATH=/app ensures this resolves correctly.
+# Copy data/feeds/ so strategies can import live OKX feeds (funding_rates,
+# order_book) without triggering the ImportError synthetic fallback.
+# The feeds are placed at /app/data/feeds/ and data/__init__.py is created
+# so Python treats data as a package under PYTHONPATH=/app.
+COPY data/feeds/ data/feeds/
+RUN touch data/__init__.py data/feeds/__init__.py
+
+# Also copy ccxt so OKX feed calls work inside the container.
+RUN pip install --no-cache-dir ccxt
 
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1

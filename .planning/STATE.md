@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** No silent failure reaches Phase 3 — every bug, race condition, and untested safety path is found and fixed before live trading begins.
-**Current focus:** Phase 5 — Test Coverage Expansion
+**Current focus:** Phase 6 — Code Quality & Fragile Pattern Remediation
 
 ## Current Position
 
-Phase: 5 of 7 (Test Coverage Expansion)
+Phase: 6 of 7 (Code Quality & Fragile Pattern Remediation)
 Plan: 0 of TBD in current phase
 Status: Ready to plan
-Last activity: 2026-04-16 — Phases 1–4 verified complete; planning docs updated
+Last activity: 2026-04-16 — Phase 5 complete: 38 new tests, di_container dead code deleted
 
-Progress: [████████░░] 57%
+Progress: [█████████░] 71%
 
 ## Performance Metrics
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import ForeignKey, Integer, Real, Text
+from sqlalchemy import ForeignKey, Integer, REAL as Real, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 

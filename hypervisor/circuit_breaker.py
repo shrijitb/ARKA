@@ -160,8 +160,9 @@ class CircuitBreaker:
             logger.warning(f"Circuit breaker '{self.name}': call failed — {exc}")
             if fallback is not None:
                 return fallback
-            if self._last_cached_value is not None:
-                return self._last_cached_value
+            # Only serve cached value when an explicit fallback was provided via
+            # the OPEN path (above). When a live call fails with no fallback,
+            # always re-raise so callers see the real exception.
             raise
 
 
