@@ -240,7 +240,15 @@ Never hardcode hex in JSX — always use token classes (`text-cream`, `bg-card`,
 - Python 3.12 + venv (for running tests locally)
 - Git
 
-### Quick start (Ubuntu 24.04)
+### One-line install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shrijitb/ARKA/main/install.sh | bash
+```
+
+Automatically detects hardware (x86\_64 or ARM64/Pi 5), selects the optimal Ollama model, generates `.env` from your inputs, and launches the full stack.
+
+### Quick start (manual, Ubuntu 24.04)
 
 ```bash
 git clone https://github.com/shrijitb/ARKA.git
