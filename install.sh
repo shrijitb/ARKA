@@ -15,8 +15,8 @@ ARCA_BRANCH="main"
 ARCA_REPO="https://github.com/shrijitb/ARCA.git"
 
 echo "═══════════════════════════════════════════════════"
-echo "  ARCA — Agentic Risk-Kinetic Allocator            "
-echo "  One-line installer starting...                   "
+echo "  ARCA — Agentic Risk-Conscious Algorithms            "
+echo "  Installer starting...                   "
 echo "═══════════════════════════════════════════════════"
 echo ""
 
