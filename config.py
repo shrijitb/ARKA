@@ -44,3 +44,11 @@ SWING_RSI_BEAR_MAX      = 60
 LOG_LEVEL               = "INFO"
 LOG_FILE                = "logs/hypervisor.log"
 STATE_SNAPSHOT_FILE     = "logs/portfolio_state.json"
+
+# ── Setup-wizard defaults (safe to run without API keys) ─────────────────────
+OKX_API_KEY              = ""   # populated by setup wizard
+OKX_API_SECRET           = ""
+OKX_API_PASSPHRASE       = ""
+TELEGRAM_BOT_TOKEN       = ""
+TELEGRAM_ALLOWED_USER_ID = ""
+FRED_API_KEY             = ""

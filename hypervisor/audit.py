@@ -66,31 +66,33 @@ audit_log = structlog.get_logger("arca.audit")
 _audit_file_path = Path("data/audit.jsonl")
 
 
-def _setup_file_handler() -> Optional[RotatingFileHandler]:
-    """Set up rotating file handler for audit logs."""
+def _setup_file_handler() -> Optional[logging.Logger]:
+    """Set up rotating file handler for audit logs. Returns a dedicated logger."""
     try:
         # Ensure data directory exists
         _audit_file_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         handler = RotatingFileHandler(
             _audit_file_path,
             maxBytes=10_000_000,  # 10MB
             backupCount=5,
         )
         handler.setFormatter(logging.Formatter('%(message)s'))
-        
-        audit_logger = logging.getLogger("arca.audit")
+
+        audit_logger = logging.getLogger("arca.audit.file")
         audit_logger.addHandler(handler)
         audit_logger.setLevel(logging.INFO)
-        
-        return handler
+        # Prevent propagation to root logger (avoids duplicate console output)
+        audit_logger.propagate = False
+
+        return audit_logger
     except Exception as exc:
         logging.warning(f"Could not set up audit file handler: {exc}")
         return None
 
 
-# Initialize file handler on module load
-_file_handler = _setup_file_handler()
+# Initialize file logger on module load
+_file_logger: Optional[logging.Logger] = _setup_file_handler()
 
 
 # ── Event Type Constants ──────────────────────────────────────────────────────
@@ -134,15 +136,11 @@ async def audit(event: str, **kwargs: Any) -> None:
     # Log via structlog (stdout)
     audit_log.info(event, **kwargs)
     
-    # Also write to file if handler is available
-    if _file_handler:
+    # Also write to file if logger is available
+    if _file_logger:
         try:
-            log_entry = json.dumps({
-                "timestamp": time.time(),
-                **context
-            })
-            _file_handler.write(log_entry + "\n")
-            _file_handler.flush()
+            log_entry = json.dumps({"timestamp": time.time(), **context})
+            _file_logger.info(log_entry)
         except Exception as exc:
             logging.warning(f"Failed to write audit entry to file: {exc}")
 

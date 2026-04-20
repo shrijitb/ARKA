@@ -231,6 +231,7 @@ classifier = RegimeClassifier()
 allocator  = RegimeAllocator(total_capital=INITIAL_CAPITAL_USD)
 risk_mgr   = RiskManager(initial_capital=INITIAL_CAPITAL_USD)
 repo       = ArcaRepository(async_session)
+_db_ready  = asyncio.Event()
 
 
 # ── Telegram notification helper ──────────────────────────────────────────────
@@ -322,9 +323,11 @@ async def lifespan(app: FastAPI):
     # Initialise SQLite database (creates tables from schema.sql if not present)
     try:
         await init_db()
+        _db_ready.set()
         logger.info("Database initialised.")
     except Exception as exc:
         logger.error("Database init failed — persistence disabled: %s", exc)
+        _db_ready.set()  # set anyway so loop doesn't block forever
 
     task = asyncio.create_task(orchestration_loop())
 
@@ -390,6 +393,7 @@ app.add_middleware(
 # ── Orchestration Loop ────────────────────────────────────────────────────────
 
 async def orchestration_loop():
+    await asyncio.wait_for(_db_ready.wait(), timeout=30.0)
     await asyncio.sleep(5)   # Give workers time to start on first boot
     while True:
         cycle_start = time.time()

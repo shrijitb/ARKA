@@ -36,8 +36,7 @@ if ! command -v docker &>/dev/null; then
     if [ "$(uname -s)" = "Linux" ]; then
         curl -fsSL https://get.docker.com | sh
         sudo usermod -aG docker "$USER" 2>/dev/null || true
-        warn "Docker installed. You may need to log out and back in for group membership."
-        warn "If 'permission denied', run: sudo usermod -aG docker \$USER && newgrp docker"
+        warn "Docker group added. Using 'sg docker' / sudo for this session — no re-login needed."
     else
         die "Please install Docker Desktop: https://www.docker.com/products/docker-desktop/"
     fi
@@ -297,10 +296,26 @@ step "Building and starting Arca"
 
 cd "$ARCA_DIR"
 
-docker compose \
-    -f docker-compose.yml \
-    -f docker-compose.profile.yml \
-    up -d --build
+_run_compose() {
+    docker compose \
+        -f docker-compose.yml \
+        -f docker-compose.profile.yml \
+        up -d --build
+}
+
+# If user was just added to the docker group this session, group may not be
+# active yet. Use `sg docker` to execute in a subshell with the group applied.
+if id -nG "$USER" 2>/dev/null | grep -qw docker; then
+    _run_compose
+elif command -v sg &>/dev/null; then
+    sg docker -c "cd '$ARCA_DIR' && docker compose -f docker-compose.yml -f docker-compose.profile.yml up -d --build" || \
+        sudo docker compose -f docker-compose.yml -f docker-compose.profile.yml up -d --build
+else
+    sudo docker compose \
+        -f docker-compose.yml \
+        -f docker-compose.profile.yml \
+        up -d --build
+fi
 
 # ── Phase 8: Health Wait ──────────────────────────────────────────
 

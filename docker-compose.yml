@@ -31,7 +31,7 @@ services:
   # The hypervisor calls this instead of mounting /var/run/docker.sock directly,
   # so a compromised hypervisor cannot run docker exec, pull images, etc.
   docker-proxy:
-    image: ghcr.io/tecnativa/docker-socket-proxy:0.4.2
+    image: ghcr.io/tecnativa/docker-socket-proxy:0.3.0
     container_name: arca-docker-proxy
     environment:
       # Allow only container restart; everything else defaults to 0 (denied).
